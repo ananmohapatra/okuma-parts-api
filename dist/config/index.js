@@ -29,7 +29,7 @@ const config = {
 const required = ['BC_ACCESS_TOKEN', 'BC_STORE_HASH', 'SESSION_SECRET', 'PARTS_BOOK_CDN_BASE_URL'];
 const missing = required.filter(key => !process.env[key]);
 if (missing.length) {
-    throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
+    console.warn(`Missing environment variables: ${missing.join(', ')}`);
 }
 exports.default = config;
 //# sourceMappingURL=index.js.map
