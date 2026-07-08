@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import express from 'express';
 import morgan from 'morgan';
 import cors from 'cors';
@@ -28,7 +29,7 @@ app.use(express.json());
 
 app.use(
     session({
-        secret: config.sessionSecret ?? '',
+        secret: config.sessionSecret || crypto.randomBytes(32).toString('hex'),
         resave: false,
         saveUninitialized: false,
         cookie: { secure: process.env.NODE_ENV === 'production', httpOnly: true, sameSite: 'lax' },

@@ -3,6 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+const crypto_1 = __importDefault(require("crypto"));
 const express_1 = __importDefault(require("express"));
 const morgan_1 = __importDefault(require("morgan"));
 const cors_1 = __importDefault(require("cors"));
@@ -25,7 +26,7 @@ app.use((0, cors_1.default)({
 }));
 app.use(express_1.default.json());
 app.use((0, express_session_1.default)({
-    secret: config_1.default.sessionSecret ?? '',
+    secret: config_1.default.sessionSecret || crypto_1.default.randomBytes(32).toString('hex'),
     resave: false,
     saveUninitialized: false,
     cookie: { secure: process.env.NODE_ENV === 'production', httpOnly: true, sameSite: 'lax' },

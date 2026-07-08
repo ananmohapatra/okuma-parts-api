@@ -1,14 +1,7 @@
 {
   "version": 2,
   "buildCommand": "npm run build",
-  "builds": [
-    { "src": "api/*.js", "use": "@vercel/node" },
-    { "src": "dist/app.js", "use": "@vercel/node" }
-  ],
-  "routes": [
-    { "src": "/api/auth", "dest": "/api/auth.js" },
-    { "src": "/api/load", "dest": "/api/load.js" },
-    { "src": "/api/uninstall", "dest": "/api/uninstall.js" },
-    { "src": "/(.*)", "dest": "/dist/app.js" }
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api/server" }
   ]
 }
