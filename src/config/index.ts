@@ -11,6 +11,8 @@ interface BcConfig {
     storeHash: string | undefined;
     appCallbackUrl: string | undefined;
     apiBaseUrl: string;
+    b2bApiBaseUrl: string;
+    b2bAuthToken: string | undefined;
 }
 
 interface AppConfig {
@@ -36,6 +38,11 @@ const config: AppConfig = {
         storeHash: process.env.BC_STORE_HASH,
         appCallbackUrl: process.env.BC_APP_CALLBACK_URL,
         apiBaseUrl: `https://api.bigcommerce.com/stores/${process.env.BC_STORE_HASH}`,
+        b2bApiBaseUrl: 'https://api-b2b.bigcommerce.com',
+        b2bAuthToken: process.env.B2B_AUTH_TOKEN ?? process.env.BC_ACCESS_TOKEN,
+
+        
+
     },
     partsBook: {
         cdnBaseUrl: process.env.PARTS_BOOK_CDN_BASE_URL,
