@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import bcClient from '../services/bigcommerce';
+import b2bClient from '../services/b2b';
 import logger from '../config/logger';
 import authenticateBCToken from '../middleware/auth';
 
@@ -57,13 +58,6 @@ interface BcMetafieldRecord {
 interface MachineSessionState {
     selected: string | null;
     recent: string[];
-}
-
-interface CustomerSearchEntry {
-    customerId: number;
-    customerName: string;
-    companyName: string | null;
-    searchedAt: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,16 +249,12 @@ function parseRecentSerials(raw: string | undefined, sessionFallback: string[]):
     }
 }
 
-/** Parse the recent_customer_searches metafield value into an array of CustomerSearchEntry objects. */
-function parseRecentSearches(raw: string | undefined): CustomerSearchEntry[] {
+/** Parse the recent_customer_searches metafield value into an array of query strings. */
+function parseRecentSearches(raw: string | undefined): string[] {
     if (!raw) return [];
     try {
-        const parsed = JSON.parse(raw) as unknown[];
-        if (!Array.isArray(parsed)) return [];
-        return parsed.filter(
-            (s): s is CustomerSearchEntry =>
-                typeof s === 'object' && s !== null && typeof (s as CustomerSearchEntry).customerId === 'number'
-        );
+        const parsed = JSON.parse(raw) as string[];
+        return Array.isArray(parsed) ? parsed.filter(s => typeof s === 'string') : [];
     } catch {
         return [];
     }
@@ -473,7 +463,7 @@ router.get('/customer/:customerId/header-context', async (req: Request<{ custome
  */
 router.post('/customer/:customerId/machine/select', async (req: Request<{ customerId: string }>, res: Response) => {
     const { customerId } = req.params;
-    const { serial, model } = req.body as { serial?: string; model?: string };
+    const { serial } = req.body as { serial?: string };
 
     if (!customerId || !/^\d+$/.test(customerId)) {
         return res.status(400).json({ error: 'Invalid customerId.' });
@@ -485,13 +475,11 @@ router.post('/customer/:customerId/machine/select', async (req: Request<{ custom
     try {
         const meta = await fetchOkumaMetafields(customerId);
         const machines = parseMachines(meta.registered_machines);
-        const machine = machines.find(
-            m => m.serial === serial.trim() && (model ? m.model === model.trim() : true)
-        );
+        const machine = machines.find(m => m.serial === serial.trim());
 
         if (!machine) {
             return res.status(404).json({
-                error: `Machine with serial '${serial}'${model ? ` and model '${model}'` : ''} not found in customer's assigned machines.`,
+                error: `Machine with serial '${serial}' not found in customer's assigned machines.`,
             });
         }
 
@@ -506,12 +494,10 @@ router.post('/customer/:customerId/machine/select', async (req: Request<{ custom
 
         writeSessionState(req, customerId, { selected: machine.serial, recent: updatedRecent });
 
-        const recentMachines = updatedRecent
-            .map(s => machines.find(m => m.serial === s))
-            .filter((m): m is Machine => m !== undefined);
-
-        // Await both BC metafield writes so GET /header-context reads fresh data immediately after.
-        const results = await Promise.allSettled([
+        // Persist to BC metafields (fire-and-forget — do not block the response).
+        // Pass metafield IDs from the initial fetch to skip a redundant GET per upsert.
+        // Promise.allSettled ensures both writes are attempted independently.
+        Promise.allSettled([
             upsertOkumaMetafield(customerId, 'last_viewed_machine', machine.serial, meta._ids.last_viewed_machine),
             upsertOkumaMetafield(
                 customerId,
@@ -519,15 +505,18 @@ router.post('/customer/:customerId/machine/select', async (req: Request<{ custom
                 JSON.stringify(updatedRecent),
                 meta._ids.recent_machines
             ),
-        ]);
-        const keys = ['last_viewed_machine', 'recent_machines'];
-        results.forEach((r, i) => {
-            if (r.status === 'rejected') {
-                logger.error(`customer ${customerId}: metafield upsert [${keys[i]}] failed: ${(r.reason as Error).message}`);
-            }
+        ]).then(results => {
+            const keys = ['last_viewed_machine', 'recent_machines'];
+            results.forEach((r, i) => {
+                if (r.status === 'rejected') {
+                    logger.error(
+                        `customer ${customerId}: metafield upsert [${keys[i]}] failed: ${(r.reason as Error).message}`
+                    );
+                }
+            });
         });
 
-        return res.json({ selectedMachine: machine, recentMachines });
+        return res.json({ selectedMachine: machine });
     } catch (err) {
         logger.error(`customer ${customerId}: machine select failed: ${(err as Error).message}`);
         return res.status(500).json({ error: 'Could not select machine.' });
@@ -537,9 +526,9 @@ router.post('/customer/:customerId/machine/select', async (req: Request<{ custom
 /**
  * GET /customer/:customerId/searches
  *
- * Returns the customer's recent searched-customer history from the BC metafield.
+ * Returns the customer's recent search history from the BC metafield.
  *
- * Response: { searches: CustomerSearchEntry[] }
+ * Response: { searches: string[] }
  */
 router.get('/customer/:customerId/searches', async (req: Request<{ customerId: string }>, res: Response) => {
     const { customerId } = req.params;
@@ -561,49 +550,30 @@ router.get('/customer/:customerId/searches', async (req: Request<{ customerId: s
 /**
  * POST /customer/:customerId/searches
  *
- * Prepends a searched customer entry to the dealer's recent search history and
- * persists it to the BC metafield. Deduplicates by searchedCustomerId. Capped
+ * Prepends a new search query to the customer's recent search history and persists
+ * it to the BC metafield. Duplicates are removed before prepending. List is capped
  * at RECENT_SEARCHES_LIMIT.
  *
- * Body:     { "customerId": 248, "customerName": "John Smith", "companyName": "Gosiger Inc." }
- * Response: { "searches": CustomerSearchEntry[] }
+ * Body:     { "query": "LB45-II spindle assembly" }
+ * Response: { "searches": string[] }
  */
 router.post('/customer/:customerId/searches', async (req: Request<{ customerId: string }>, res: Response) => {
     const { customerId } = req.params;
-    const {
-        customerId: searchedCustomerId,
-        customerName,
-        companyName,
-    } = req.body as {
-        customerId?: unknown;
-        customerName?: unknown;
-        companyName?: unknown;
-    };
+    const { query } = req.body as { query?: string };
 
     if (!customerId || !/^\d+$/.test(customerId)) {
         return res.status(400).json({ error: 'Invalid customerId.' });
     }
-    if (!searchedCustomerId || typeof searchedCustomerId !== 'number') {
-        return res.status(400).json({ error: 'customerId (searched customer) must be a number.' });
-    }
-    if (!customerName || typeof customerName !== 'string' || !customerName.trim()) {
-        return res.status(400).json({ error: 'customerName is required.' });
+    if (!query || typeof query !== 'string' || !query.trim()) {
+        return res.status(400).json({ error: 'query is required.' });
     }
 
-    const entry: CustomerSearchEntry = {
-        customerId: searchedCustomerId,
-        customerName: (customerName as string).trim(),
-        companyName: typeof companyName === 'string' ? companyName.trim() || null : null,
-        searchedAt: new Date().toISOString(),
-    };
+    const trimmedQuery = query.trim();
 
     try {
         const meta = await fetchOkumaMetafields(customerId);
         const current = parseRecentSearches(meta.recent_customer_searches);
-        const updated = [entry, ...current.filter(s => s.customerId !== entry.customerId)].slice(
-            0,
-            RECENT_SEARCHES_LIMIT
-        );
+        const updated = [trimmedQuery, ...current.filter(s => s !== trimmedQuery)].slice(0, RECENT_SEARCHES_LIMIT);
 
         await upsertOkumaMetafield(
             customerId,
@@ -620,47 +590,79 @@ router.post('/customer/:customerId/searches', async (req: Request<{ customerId: 
 });
 
 /**
- * GET /customer/:customerId/metafields?namespace=okuma&key=recent_customer_searches
+ * GET /customer/:customerId/companyProfile
  *
- * General-purpose BC customer metafield proxy. Returns the raw value for the
- * given namespace + key combination, proxied server-side to avoid CORS.
+ * Returns the customer's name, company name, account number, and address.
  *
- * Query params:
- *   namespace  — required, e.g. "okuma"
- *   key        — required, e.g. "recent_customer_searches"
+ * Call 1 [OOTB B3]: GET /api/v3/io/users?bcCustomerId={id}  → firstName, lastName, companyId
+ * Call 2 [OOTB B3]: GET /api/v3/io/companies/{companyId}    → companyName, address, accountNumber
  *
- * Response: { customerId, namespace, key, value: string | null }
+ * Response: { customerName, companyName, accountNumber, address }
  */
-router.get('/customer/:customerId/metafields', async (req: Request<{ customerId: string }>, res: Response) => {
-    const { customerId } = req.params;
-    const { namespace, key } = req.query as Record<string, string>;
+router.get(
+    '/customer/:customerId/companyProfile',
+    authenticateBCToken,
+    async (req: Request<{ customerId: string }>, res: Response) => {
+        const { customerId } = req.params;
 
-    if (!customerId || !/^\d+$/.test(customerId)) {
-        return res.status(400).json({ error: 'Invalid customerId.' });
-    }
-    if (!namespace || !namespace.trim()) {
-        return res.status(400).json({ error: 'namespace query param is required.' });
-    }
-    if (!key || !key.trim()) {
-        return res.status(400).json({ error: 'key query param is required.' });
-    }
+        if (!customerId || !/^\d+$/.test(customerId)) {
+            return res.status(400).json({ error: 'Invalid customerId.' });
+        }
 
-    try {
-        const bcRes = await bcClient.get<{ data: BcMetafieldRecord[] }>(`/v3/customers/${customerId}/metafields`, {
-            params: { namespace: namespace.trim(), key: key.trim() },
-        });
-        const record = bcRes.data?.data?.[0] ?? null;
+        try {
+            // Call 1 — resolve customer name + companyId from B3
+            const usersRes = await b2bClient.get(`/api/v3/io/users?bcCustomerId=${customerId}`);
+            const b3User = usersRes.data?.data?.[0];
 
-        return res.json({
-            customerId: parseInt(customerId, 10),
-            namespace: namespace.trim(),
-            key: key.trim(),
-            value: record ? record.value : null,
-        });
-    } catch (err) {
-        logger.error(`customer ${customerId}: metafield fetch [${namespace}/${key}] failed: ${(err as Error).message}`);
-        return res.status(500).json({ error: 'Could not load metafield.' });
+            if (!b3User) {
+                return res.status(404).json({ error: 'Customer not found in B2B.' });
+            }
+
+            const { firstName, lastName, companyId } = b3User;
+
+            // Fix #1: guard against missing companyId before calling companies API
+            if (companyId === null || companyId === undefined) {
+                return res.status(404).json({ error: 'Company not found for customer.' });
+            }
+
+            // Call 2 — resolve company details from B3
+            const companyRes = await b2bClient.get(`/api/v3/io/companies/${companyId}`);
+            const company = companyRes.data?.data;
+
+            if (!company) {
+                return res.status(404).json({ error: 'Company not found.' });
+            }
+
+            const accountNumber =
+                (company.extraFields ?? []).find((f: any) => f.fieldName === 'Account Number')?.fieldValue ?? null;
+
+            const addressParts = [company.addressLine1, company.city, company.state, company.zipCode, company.country]
+                .map((p: string) => (p ?? '').trim())
+                .filter(Boolean);
+
+            return res.json({
+                // Fix #2: coalesce to empty strings to avoid "undefined"/"null" in response
+                customerName: `${firstName ?? ''} ${lastName ?? ''}`.trim(),
+                companyName: company.companyName ?? null,
+                accountNumber,
+                address: {
+                    line1: company.addressLine1 ?? '',
+                    city: company.city ?? '',
+                    state: company.state ?? '',
+                    zipCode: company.zipCode ?? '',
+                    country: company.country ?? '',
+                    formatted: addressParts.join(', '),
+                },
+            });
+        } catch (err: any) {
+            // Fix #3: map upstream B2B 404s to 404 instead of 500
+            if (err?.response?.status === 404) {
+                return res.status(404).json({ error: 'Customer or company not found.' });
+            }
+            logger.error(`customer ${customerId}: companyProfile failed: ${err?.message ?? 'Unknown error'}`);
+            return res.status(500).json({ error: 'Could not load company profile.' });
+        }
     }
-});
+);
 
 export default router;
