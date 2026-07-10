@@ -8,6 +8,9 @@ const router = Router();
 const GROUP_CACHE_TTL = 5 * 60 * 1000; // 5 minutes — groups change rarely
 const B2B_PAGE_LIMIT = 100;
 const BC_CUSTOMER_FILTER_LIMIT = 250;
+const RECENT_SEARCH_NAMESPACE = 'okuma';
+const RECENT_SEARCH_KEY = 'recent_customer_searches';
+const RECENT_SEARCH_LIMIT = 3;
 
 // ---------------------------------------------------------------------------
 // Types — BC
@@ -36,6 +39,23 @@ interface BcCustomer {
     customer_group_id: number | null;
     date_created: string | null;
     date_modified: string | null;
+}
+
+interface BcMetafield {
+    id: number;
+    key: string;
+    value: string;
+    namespace: string;
+    permission_set: string;
+    resource_id: number;
+    resource_type: string;
+}
+
+interface RecentCustomerSearch {
+    customerId: number;
+    customerName: string;
+    companyName: string;
+    searchedAt: string; // ISO 8601
 }
 
 interface BcCustomerGroup {
@@ -313,6 +333,70 @@ async function fetchCustomerIdsFromHierarchy(dealerEmail: string): Promise<Deale
 }
 
 // ---------------------------------------------------------------------------
+// Recent-search helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch the dealer's recent_customer_searches metafield.
+ * Returns the raw BC metafield record, or null when it does not yet exist.
+ */
+async function fetchRecentSearchMetafield(dealerId: string): Promise<BcMetafield | null> {
+    const res = await bcClient.get<{ data: BcMetafield[] }>(`/v3/customers/${dealerId}/metafields`, {
+        params: { namespace: RECENT_SEARCH_NAMESPACE, key: RECENT_SEARCH_KEY },
+    });
+    return res.data?.data?.[0] ?? null;
+}
+
+/**
+ * Persist a new recent customer search for the dealer.
+ *
+ * - De-duplicates by customerId (a repeated search moves the entry to the front with an updated timestamp).
+ * - Keeps at most RECENT_SEARCH_LIMIT entries, ordered most-recent first.
+ * - Creates the metafield on first call; updates it on subsequent calls.
+ *
+ * BC OOTB calls:
+ *   GET /v3/customers/:dealerId/metafields?namespace=okuma&key=recent_customer_searches
+ *   POST /v3/customers/:dealerId/metafields  (first call)
+ *   PUT  /v3/customers/:dealerId/metafields/:id  (subsequent calls)
+ */
+async function upsertRecentCustomerSearches(
+    dealerId: string,
+    newEntry: RecentCustomerSearch
+): Promise<RecentCustomerSearch[]> {
+    const existing = await fetchRecentSearchMetafield(dealerId);
+
+    let current: RecentCustomerSearch[] = [];
+    if (existing) {
+        try {
+            const parsed = JSON.parse(existing.value);
+            if (Array.isArray(parsed)) current = parsed as RecentCustomerSearch[];
+        } catch {
+            logger.warn(`dealer ${dealerId}: recent_customer_searches metafield contained invalid JSON — resetting`);
+        }
+    }
+
+    const updated = [newEntry, ...current.filter(s => s.customerId !== newEntry.customerId)].slice(
+        0,
+        RECENT_SEARCH_LIMIT
+    );
+
+    const value = JSON.stringify(updated);
+
+    if (existing) {
+        await bcClient.put(`/v3/customers/${dealerId}/metafields/${existing.id}`, { value });
+    } else {
+        await bcClient.post(`/v3/customers/${dealerId}/metafields`, {
+            permission_set: 'write_and_sf_access',
+            namespace: RECENT_SEARCH_NAMESPACE,
+            key: RECENT_SEARCH_KEY,
+            value,
+        });
+    }
+
+    return updated;
+}
+
+// ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
 
@@ -509,6 +593,76 @@ router.get('/dealers/:dealerId/customers', async (req, res) => {
     } catch (err) {
         logger.error(`dealer ${dealerId}: customer fetch failed: ${(err as Error).message}`);
         return res.status(500).json({ error: 'Could not load dealer customers.' });
+    }
+});
+
+/**
+ * POST /v1/api/dealers/:dealerId/recent-customer-search
+ *
+ * Records a customer the dealer selected/searched, storing the last 3 unique
+ * entries (most-recent first) in the dealer's BC customer metafield.
+ *
+ * Body:
+ * {
+ *   "customerId":   123,
+ *   "customerName": "ACME Corp"
+ * }
+ *
+ * Response:
+ * {
+ *   "recentSearches": [
+ *     { "customerId": 123, "customerName": "ACME Corp", "searchedAt": "2026-07-10T14:30:00.000Z" },
+ *     ...
+ *   ]
+ * }
+ *
+ * BC OOTB calls:
+ *   GET  /v3/customers/:dealerId/metafields?namespace=okuma&key=recent_customer_searches
+ *   POST /v3/customers/:dealerId/metafields   (first call per dealer)
+ *   PUT  /v3/customers/:dealerId/metafields/:id  (subsequent calls)
+ */
+router.post('/dealers/:dealerId/recent-customer-search', async (req, res) => {
+    const { dealerId } = req.params;
+
+    if (!dealerId || !/^\d+$/.test(dealerId)) {
+        return res.status(400).json({ error: 'Invalid dealerId — must be a numeric BC customer ID.' });
+    }
+
+    const { customerId, customerName, companyName } = req.body as {
+        customerId?: unknown;
+        customerName?: unknown;
+        companyName?: unknown;
+    };
+
+    if (
+        customerId === undefined ||
+        customerId === null ||
+        typeof customerId !== 'number' ||
+        !Number.isInteger(customerId) ||
+        customerId <= 0
+    ) {
+        return res.status(400).json({ error: 'customerId must be a positive integer.' });
+    }
+    if (!customerName || typeof customerName !== 'string' || !customerName.trim()) {
+        return res.status(400).json({ error: 'customerName is required.' });
+    }
+    if (!companyName || typeof companyName !== 'string' || !companyName.trim()) {
+        return res.status(400).json({ error: 'companyName is required.' });
+    }
+
+    const newEntry: RecentCustomerSearch = {
+        customerId,
+        customerName: customerName.trim(),
+        companyName: companyName.trim(),
+        searchedAt: new Date().toISOString(),
+    };
+
+    try {
+        await upsertRecentCustomerSearches(dealerId, newEntry);
+        return res.status(200).json({ message: 'Recent customer search saved successfully.' });
+    } catch (err) {
+        logger.error(`dealer ${dealerId}: recent-customer-search POST failed: ${(err as Error).message}`);
+        return res.status(500).json({ error: 'Could not save recent customer search.' });
     }
 });
 

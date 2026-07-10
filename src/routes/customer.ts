@@ -331,10 +331,7 @@ router.post(
  *
  * Response: { dealerId: number, dealerName: string } | { dealerId: null, dealerName: null }
  */
-router.get(
-    '/customer/:customerId/distributor',
-    requireCustomerAuth,
-    async (req: Request<{ customerId: string }>, res: Response) => {
+router.get('/customer/:customerId/distributor', async (req: Request<{ customerId: string }>, res: Response) => {
         const { customerId } = req.params;
 
         if (!customerId || !/^\d+$/.test(customerId)) {
@@ -364,8 +361,7 @@ router.get(
             logger.error(`customer ${customerId}: distributor lookup failed: ${(err as Error).message}`);
             return res.status(500).json({ error: 'Could not load distributor.' });
         }
-    }
-);
+});
 
 /**
  * GET /customer/:customerId/machines
@@ -374,10 +370,7 @@ router.get(
  *
  * Response: { count: number, machines: [{ model, serial, display, installDate, status }] }
  */
-router.get(
-    '/customer/:customerId/machines',
-    requireCustomerAuth,
-    async (req: Request<{ customerId: string }>, res: Response) => {
+router.get('/customer/:customerId/machines', async (req: Request<{ customerId: string }>, res: Response) => {
         const { customerId } = req.params;
 
         if (!customerId || !/^\d+$/.test(customerId)) {
@@ -392,8 +385,7 @@ router.get(
             logger.error(`customer ${customerId}: machines fetch failed: ${(err as Error).message}`);
             return res.status(500).json({ error: 'Could not load customer machines.' });
         }
-    }
-);
+});
 
 /**
  * GET /customer/:customerId/header-context
@@ -415,10 +407,7 @@ router.get(
  *   recentMachines:  [...]              // last 3 selected, most-recent first
  * }
  */
-router.get(
-    '/customer/:customerId/header-context',
-    requireCustomerAuth,
-    async (req: Request<{ customerId: string }>, res: Response) => {
+router.get('/customer/:customerId/header-context', async (req: Request<{ customerId: string }>, res: Response) => {
         const { customerId } = req.params;
 
         if (!customerId || !/^\d+$/.test(customerId)) {
@@ -470,8 +459,7 @@ router.get(
             logger.error(`customer ${customerId}: header-context failed: ${(err as Error).message}`);
             return res.status(500).json({ error: 'Could not load customer context.' });
         }
-    }
-);
+});
 
 /**
  * POST /customer/:customerId/machine/select
@@ -484,10 +472,7 @@ router.get(
  * Body:     { "serial": "M5-2891-K" }
  * Response: { "selectedMachine": { model, serial, display, installDate, status } }
  */
-router.post(
-    '/customer/:customerId/machine/select',
-    requireCustomerAuth,
-    async (req: Request<{ customerId: string }>, res: Response) => {
+router.post('/customer/:customerId/machine/select', async (req: Request<{ customerId: string }>, res: Response) => {
         const { customerId } = req.params;
         const { serial } = req.body as { serial?: string };
 
@@ -547,7 +532,6 @@ router.post(
             logger.error(`customer ${customerId}: machine select failed: ${(err as Error).message}`);
             return res.status(500).json({ error: 'Could not select machine.' });
         }
-    }
-);
+});
 
 export default router;
