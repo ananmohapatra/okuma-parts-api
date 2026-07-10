@@ -59,6 +59,13 @@ interface MachineSessionState {
     recent: string[];
 }
 
+interface CustomerSearchEntry {
+    customerId: number;
+    customerName: string;
+    companyName: string | null;
+    searchedAt: string;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -248,12 +255,16 @@ function parseRecentSerials(raw: string | undefined, sessionFallback: string[]):
     }
 }
 
-/** Parse the recent_customer_searches metafield value into an array of query strings. */
-function parseRecentSearches(raw: string | undefined): string[] {
+/** Parse the recent_customer_searches metafield value into an array of CustomerSearchEntry objects. */
+function parseRecentSearches(raw: string | undefined): CustomerSearchEntry[] {
     if (!raw) return [];
     try {
-        const parsed = JSON.parse(raw) as string[];
-        return Array.isArray(parsed) ? parsed.filter(s => typeof s === 'string') : [];
+        const parsed = JSON.parse(raw) as unknown[];
+        if (!Array.isArray(parsed)) return [];
+        return parsed.filter(
+            (s): s is CustomerSearchEntry =>
+                typeof s === 'object' && s !== null && typeof (s as CustomerSearchEntry).customerId === 'number'
+        );
     } catch {
         return [];
     }
@@ -525,9 +536,9 @@ router.post('/customer/:customerId/machine/select', async (req: Request<{ custom
 /**
  * GET /customer/:customerId/searches
  *
- * Returns the customer's recent search history from the BC metafield.
+ * Returns the customer's recent searched-customer history from the BC metafield.
  *
- * Response: { searches: string[] }
+ * Response: { searches: CustomerSearchEntry[] }
  */
 router.get('/customer/:customerId/searches', async (req: Request<{ customerId: string }>, res: Response) => {
     const { customerId } = req.params;
@@ -549,30 +560,49 @@ router.get('/customer/:customerId/searches', async (req: Request<{ customerId: s
 /**
  * POST /customer/:customerId/searches
  *
- * Prepends a new search query to the customer's recent search history and persists
- * it to the BC metafield. Duplicates are removed before prepending. List is capped
+ * Prepends a searched customer entry to the dealer's recent search history and
+ * persists it to the BC metafield. Deduplicates by searchedCustomerId. Capped
  * at RECENT_SEARCHES_LIMIT.
  *
- * Body:     { "query": "LB45-II spindle assembly" }
- * Response: { "searches": string[] }
+ * Body:     { "customerId": 248, "customerName": "John Smith", "companyName": "Gosiger Inc." }
+ * Response: { "searches": CustomerSearchEntry[] }
  */
 router.post('/customer/:customerId/searches', async (req: Request<{ customerId: string }>, res: Response) => {
     const { customerId } = req.params;
-    const { query } = req.body as { query?: string };
+    const {
+        customerId: searchedCustomerId,
+        customerName,
+        companyName,
+    } = req.body as {
+        customerId?: unknown;
+        customerName?: unknown;
+        companyName?: unknown;
+    };
 
     if (!customerId || !/^\d+$/.test(customerId)) {
         return res.status(400).json({ error: 'Invalid customerId.' });
     }
-    if (!query || typeof query !== 'string' || !query.trim()) {
-        return res.status(400).json({ error: 'query is required.' });
+    if (!searchedCustomerId || typeof searchedCustomerId !== 'number') {
+        return res.status(400).json({ error: 'customerId (searched customer) must be a number.' });
+    }
+    if (!customerName || typeof customerName !== 'string' || !customerName.trim()) {
+        return res.status(400).json({ error: 'customerName is required.' });
     }
 
-    const trimmedQuery = query.trim();
+    const entry: CustomerSearchEntry = {
+        customerId: searchedCustomerId,
+        customerName: (customerName as string).trim(),
+        companyName: typeof companyName === 'string' ? companyName.trim() || null : null,
+        searchedAt: new Date().toISOString(),
+    };
 
     try {
         const meta = await fetchOkumaMetafields(customerId);
         const current = parseRecentSearches(meta.recent_customer_searches);
-        const updated = [trimmedQuery, ...current.filter(s => s !== trimmedQuery)].slice(0, RECENT_SEARCHES_LIMIT);
+        const updated = [entry, ...current.filter(s => s.customerId !== entry.customerId)].slice(
+            0,
+            RECENT_SEARCHES_LIMIT
+        );
 
         await upsertOkumaMetafield(
             customerId,
@@ -585,6 +615,50 @@ router.post('/customer/:customerId/searches', async (req: Request<{ customerId: 
     } catch (err) {
         logger.error(`customer ${customerId}: searches update failed: ${(err as Error).message}`);
         return res.status(500).json({ error: 'Could not update recent searches.' });
+    }
+});
+
+/**
+ * GET /customer/:customerId/metafields?namespace=okuma&key=recent_customer_searches
+ *
+ * General-purpose BC customer metafield proxy. Returns the raw value for the
+ * given namespace + key combination, proxied server-side to avoid CORS.
+ *
+ * Query params:
+ *   namespace  — required, e.g. "okuma"
+ *   key        — required, e.g. "recent_customer_searches"
+ *
+ * Response: { customerId, namespace, key, value: string | null }
+ */
+router.get('/customer/:customerId/metafields', async (req: Request<{ customerId: string }>, res: Response) => {
+    const { customerId } = req.params;
+    const { namespace, key } = req.query as Record<string, string>;
+
+    if (!customerId || !/^\d+$/.test(customerId)) {
+        return res.status(400).json({ error: 'Invalid customerId.' });
+    }
+    if (!namespace || !namespace.trim()) {
+        return res.status(400).json({ error: 'namespace query param is required.' });
+    }
+    if (!key || !key.trim()) {
+        return res.status(400).json({ error: 'key query param is required.' });
+    }
+
+    try {
+        const bcRes = await bcClient.get<{ data: BcMetafieldRecord[] }>(`/v3/customers/${customerId}/metafields`, {
+            params: { namespace: namespace.trim(), key: key.trim() },
+        });
+        const record = bcRes.data?.data?.[0] ?? null;
+
+        return res.json({
+            customerId: parseInt(customerId, 10),
+            namespace: namespace.trim(),
+            key: key.trim(),
+            value: record ? record.value : null,
+        });
+    } catch (err) {
+        logger.error(`customer ${customerId}: metafield fetch [${namespace}/${key}] failed: ${(err as Error).message}`);
+        return res.status(500).json({ error: 'Could not load metafield.' });
     }
 });
 
