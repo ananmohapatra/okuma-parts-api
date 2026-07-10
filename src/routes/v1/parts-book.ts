@@ -304,13 +304,12 @@ const PARENT_LABELS: Record<number, string> = {
     304: 'Machining Centers',
 };
 
-const PUB_NO_RE = /Pub\s+No\.\s*([A-Z]{2}\d{2}-\d{3}-[A-Z0-9]+)/i;
+const PUB_NO_RE = /Pub\s+No\.\s*([A-Z]{2}\d{2}-\d{3}-[A-Z0-9]+)/gi;
 
-function parsePubNo(description: string | undefined): string | null {
-    if (!description) return null;
+function parsePubNos(description: string | undefined): string[] {
+    if (!description) return [];
     const plain = description.replace(/<[^>]+>/g, ' ');
-    const m = plain.match(PUB_NO_RE);
-    return m ? m[1] : null;
+    return Array.from(plain.matchAll(PUB_NO_RE), m => m[1].toUpperCase());
 }
 
 router.get('/machines', async (_req: Request, res: Response, next: NextFunction) => {
@@ -328,7 +327,7 @@ router.get('/machines', async (_req: Request, res: Response, next: NextFunction)
             name: cat.name,
             machineType: PARENT_LABELS[cat.parent_id] ?? null,
             imageUrl: cat.image_url ?? '',
-            pubNo: parsePubNo(cat.description),
+            pubNos: parsePubNos(cat.description),
         }));
 
         return res.json({ machines });
@@ -342,8 +341,7 @@ interface MachineCategory {
     name: string;
     machineType: string | null;
     imageUrl: string;
-    pubNo?: string | null;
-    pubNos?: string[] | string | null;
+    pubNos: string[];
     _normalised: string;
 }
 
@@ -380,7 +378,7 @@ async function fetchMachineCategories(): Promise<MachineCategory[]> {
         name: cat.name,
         machineType: PARENT_LABELS[cat.parent_id] ?? null,
         imageUrl: cat.image_url ?? '',
-        pubNo: parsePubNo(cat.description),
+        pubNos: parsePubNos(cat.description),
         _normalised: cat.name.toLowerCase().replace(/[^a-z0-9]/g, ''),
     }));
     _machineCategoryCachedAt = now;
@@ -402,7 +400,7 @@ router.get('/api/machines', async (_req, res) => {
             name: cat.name,
             machineType: cat.machineType,
             imageUrl: cat.imageUrl,
-            pubNos: cat.pubNos ?? cat.pubNo ?? null,
+            pubNos: cat.pubNos,
         }));
         return res.json({ machines });
     } catch (err) {
@@ -482,7 +480,7 @@ router.get('/customer/:customerId/machines', async (req: Request, res: Response,
                     installDate: m.install_date ?? null,
                     status: m.status ?? null,
                     imageUrl: cat ? cat.imageUrl : '',
-                    pubNo: cat ? cat.pubNo : null,
+                    pubNos: cat ? cat.pubNos : [],
                     machineType: cat ? cat.machineType : null,
                     categoryId: cat ? cat.categoryId : null,
                 };

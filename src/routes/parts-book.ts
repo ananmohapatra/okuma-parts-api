@@ -1,9 +1,7 @@
 import axios from 'axios';
-import { Router, NextFunction, Request, Response } from 'express';
-import config from '../../config';
-import logger from '../../config/logger';
-import bcClient from '../../services/bigcommerce';
-import { AppError, NotFoundError } from '../../middleware/errors';
+import { Router } from 'express';
+import config from '../config';
+import bcClient from '../services/bigcommerce';
 
 const router = Router();
 
@@ -89,7 +87,7 @@ async function fetchDataJson<T>(relativePath: string): Promise<T | null> {
         if (axios.isAxiosError(err) && err.response?.status === 404) {
             return null;
         }
-        logger.error(`parts-book: failed to fetch ${url}: ${(err as Error).message}`);
+        console.error(`parts-book: failed to fetch ${url}:`, (err as Error).message);
         return null;
     }
 }
@@ -148,7 +146,7 @@ async function fetchCategoryImages(categoryIds: number[]): Promise<Record<number
         });
         return result;
     } catch (err) {
-        logger.error(`parts-book: category image lookup failed: ${(err as Error).message}`);
+        console.error('parts-book: category image lookup failed:', (err as Error).message);
         return {};
     }
 }
@@ -166,130 +164,142 @@ async function fetchCategoryImages(categoryIds: number[]): Promise<Record<number
  * With    ?id  — returns a single document entry matching that pdfId.
  *               Responds 404 when the id is not found.
  */
-router.get('/parts-book/toc', async (_req: Request, res: Response, next: NextFunction) => {
-    try {
-        const toc = await fetchDataJson<Toc>('toc.json');
+router.get('/api/parts-book/toc', async (req, res) => {
+    const toc = await fetchDataJson<Toc>('toc.json');
 
-        if (!toc) {
-            return next(new AppError('Table of contents not available.', 500));
-        }
-
-        const rewritten = rewriteTocImagePaths(toc);
-
-        const categoryIds = rewritten.documents
-            .map(d => d.category_id)
-            .filter((id): id is number => typeof id === 'number');
-
-        const categoryImages = await fetchCategoryImages([...new Set(categoryIds)]);
-
-        const documents = rewritten.documents.map(doc => ({
-            ...doc,
-            category_image: doc.category_id ? (categoryImages[doc.category_id] ?? '') : '',
-        }));
-
-        return res.json({ ...rewritten, documents });
-    } catch (err) {
-        return next(err);
+    if (!toc) {
+        console.error('parts-book: toc.json not found at', config.partsBook.cdnBaseUrl);
+        return res.status(500).json({ error: 'Table of contents not available.' });
     }
+
+    const rewritten = rewriteTocImagePaths(toc);
+
+    // When ?id is provided, scope to that single document only
+    const { id } = req.query;
+    const sourceDocuments = id ? rewritten.documents.filter(d => d.id === id) : rewritten.documents;
+
+    if (id && sourceDocuments.length === 0) {
+        return res.status(404).json({ error: `Document '${id}' not found.` });
+    }
+
+    const categoryIds = sourceDocuments.map(d => d.category_id).filter((id1): id1 is number => typeof id1 === 'number');
+
+    const categoryImages = await fetchCategoryImages([...new Set(categoryIds)]);
+
+    const documents = sourceDocuments.map(doc => ({
+        ...doc,
+        category_image: doc.category_id ? (categoryImages[doc.category_id] ?? '') : '',
+    }));
+
+    // When a single document was requested return it unwrapped for convenience
+    if (id) {
+        return res.json(documents[0]);
+    }
+
+    return res.json({ ...rewritten, documents });
 });
 
-router.get(
-    '/parts-book/sheets/:pdfId/:assemblySlug/:sheetSlug/parts',
-    async (req: Request, res: Response, next: NextFunction) => {
+router.get('/api/parts-book/sheets/:pdfId/:assemblySlug/:sheetSlug/parts', async (req, res) => {
+    const { pdfId, assemblySlug, sheetSlug } = req.params;
+
+    const toc = await fetchDataJson<Toc>('toc.json');
+
+    if (!toc) {
+        console.error('parts-book: toc.json not found');
+        return res.status(500).json({ error: 'Table of contents not available.' });
+    }
+
+    const doc = toc.documents.find(d => d.id === pdfId);
+    if (!doc) {
+        return res.status(404).json({ error: `Document '${pdfId}' not found.` });
+    }
+
+    const assembly = doc.assemblies.find(a => a.slug === assemblySlug);
+    if (!assembly) {
+        return res.status(404).json({ error: `Assembly '${assemblySlug}' not found.` });
+    }
+
+    const sheet = assembly.sheets.find(s => s.slug === sheetSlug);
+    if (!sheet) {
+        return res.status(404).json({ error: `Sheet '${sheetSlug}' not found.` });
+    }
+
+    const partsData = await fetchDataJson<PartsData>(sheet.parts_json);
+
+    if (!partsData) {
+        console.error(`parts-book: parts.json not found at ${sheet.parts_json}`);
+        return res.status(500).json({ error: 'Parts data not available for this sheet.' });
+    }
+
+    const rawParts = partsData.parts ?? [];
+
+    const matchedSkus = [
+        ...new Set(rawParts.filter(p => p.has_table_match && p.part_no).map(p => p.part_no as string)),
+    ];
+
+    const bcLookup: Record<string, BcLookupEntry> = {};
+
+    if (matchedSkus.length > 0) {
         try {
-            const { pdfId, assemblySlug, sheetSlug } = req.params;
+            const response = await bcClient.get<{ data: BcProduct[] }>('/v3/catalog/products', {
+                params: {
+                    'sku:in': matchedSkus.join(','),
+                    limit: 50,
+                    include_fields: 'id,sku,name,price,inventory_level,inventory_tracking,availability',
+                },
+            });
 
-            const toc = await fetchDataJson<Toc>('toc.json');
-            if (!toc) {
-                return next(new AppError('Table of contents not available.', 500));
-            }
+            const bcProducts = response.data?.data ?? [];
 
-            const doc = toc.documents.find(d => d.id === pdfId);
-            if (!doc) {
-                return next(new NotFoundError(`Document '${pdfId}' not found.`));
-            }
+            bcProducts.forEach(product => {
+                const notTracked = product.inventory_tracking === 'none';
+                const inStock = product.availability === 'available' && (notTracked || product.inventory_level > 0);
 
-            const assembly = doc.assemblies.find(a => a.slug === assemblySlug);
-            if (!assembly) {
-                return next(new NotFoundError(`Assembly '${assemblySlug}' not found.`));
-            }
-
-            const sheet = assembly.sheets.find(s => s.slug === sheetSlug);
-            if (!sheet) {
-                return next(new NotFoundError(`Sheet '${sheetSlug}' not found.`));
-            }
-
-            const partsData = await fetchDataJson<PartsData>(sheet.parts_json);
-            if (!partsData) {
-                return next(new AppError('Parts data not available for this sheet.', 500));
-            }
-
-            const rawParts = partsData.parts ?? [];
-
-            const matchedSkus = [
-                ...new Set(rawParts.filter(p => p.has_table_match && p.part_no).map(p => p.part_no as string)),
-            ];
-
-            const bcLookup: Record<string, BcLookupEntry> = {};
-
-            if (matchedSkus.length > 0) {
-                try {
-                    const response = await bcClient.get<{ data: BcProduct[] }>('/v3/catalog/products', {
-                        params: {
-                            'sku:in': matchedSkus.join(','),
-                            limit: 50,
-                            include_fields: 'id,sku,name,price,inventory_level,inventory_tracking,availability',
-                        },
-                    });
-
-                    (response.data?.data ?? []).forEach(product => {
-                        const notTracked = product.inventory_tracking === 'none';
-                        const inStock =
-                            product.availability === 'available' && (notTracked || product.inventory_level > 0);
-                        bcLookup[product.sku] = { productId: product.id, price: product.price, inStock };
-                    });
-                } catch (err) {
-                    logger.error(`parts-book: BC product lookup failed: ${(err as Error).message}`);
-                }
-            }
-
-            const parts = rawParts.map(p => {
-                const coords = p.callout_box_2d != null ? boxToPercent(p.callout_box_2d) : null;
-                const { calloutX = null, calloutY = null } = coords ?? {};
-                const bc = p.part_no ? (bcLookup[p.part_no] ?? null) : null;
-
-                return {
-                    calloutNumber: p.callout_number,
-                    sheetItem: p.sheet_item,
-                    partNo: p.part_no,
-                    description: p.description,
-                    unitNo: p.unit_no,
-                    qty: p.qty,
-                    calloutX,
-                    calloutY,
-                    price: bc ? bc.price : null,
-                    inStock: bc ? bc.inStock : false,
-                    productId: bc ? bc.productId : null,
-                    hasTableMatch: p.has_table_match === true,
+                bcLookup[product.sku] = {
+                    productId: product.id,
+                    price: product.price,
+                    inStock,
                 };
             });
-
-            const cdnBase = config.partsBook.cdnBaseUrl;
-
-            return res.json({
-                sheet: {
-                    id: sheet.id,
-                    label: sheet.label,
-                    sheetNumber: sheet.sheet_number,
-                    diagramUrl: sheet.assembly_image ? `${cdnBase}/${sheet.assembly_image}` : null,
-                },
-                parts,
-            });
         } catch (err) {
-            return next(err);
+            console.error('parts-book: BC product lookup failed:', (err as Error).message);
         }
     }
-);
+
+    const parts = rawParts.map(p => {
+        const coords = p.callout_box_2d != null ? boxToPercent(p.callout_box_2d) : null;
+        const { calloutX = null, calloutY = null } = coords ?? {};
+
+        const bc = p.part_no ? (bcLookup[p.part_no] ?? null) : null;
+
+        return {
+            calloutNumber: p.callout_number,
+            sheetItem: p.sheet_item,
+            partNo: p.part_no,
+            description: p.description,
+            unitNo: p.unit_no,
+            qty: p.qty,
+            calloutX,
+            calloutY,
+            price: bc ? bc.price : null,
+            inStock: bc ? bc.inStock : false,
+            productId: bc ? bc.productId : null,
+            hasTableMatch: p.has_table_match === true,
+        };
+    });
+
+    const cdnBase = config.partsBook.cdnBaseUrl;
+
+    return res.json({
+        sheet: {
+            id: sheet.id,
+            label: sheet.label,
+            sheetNumber: sheet.sheet_number,
+            diagramUrl: sheet.assembly_image ? `${cdnBase}/${sheet.assembly_image}` : null,
+        },
+        parts,
+    });
+});
 
 // ---------------------------------------------------------------------------
 // Machines
@@ -309,32 +319,8 @@ const PUB_NO_RE = /Pub\s+No\.\s*([A-Z]{2}\d{2}-\d{3}-[A-Z0-9]+)/gi;
 function parsePubNos(description: string | undefined): string[] {
     if (!description) return [];
     const plain = description.replace(/<[^>]+>/g, ' ');
-    return Array.from(plain.matchAll(PUB_NO_RE), m => m[1].toUpperCase());
+    return [...plain.matchAll(PUB_NO_RE)].map(m => m[1]);
 }
-
-router.get('/machines', async (_req: Request, res: Response, next: NextFunction) => {
-    try {
-        const response = await bcClient.get<{ data: BcCategory[] }>('/v3/catalog/categories', {
-            params: {
-                'parent_id:in': MACHINE_PARENT_IDS.join(','),
-                limit: 250,
-                include_fields: 'id,name,image_url,parent_id,description',
-            },
-        });
-
-        const machines = (response.data?.data ?? []).map(cat => ({
-            categoryId: cat.id,
-            name: cat.name,
-            machineType: PARENT_LABELS[cat.parent_id] ?? null,
-            imageUrl: cat.image_url ?? '',
-            pubNos: parsePubNos(cat.description),
-        }));
-
-        return res.json({ machines });
-    } catch (err) {
-        return next(err);
-    }
-});
 
 interface MachineCategory {
     categoryId: number;
@@ -382,7 +368,7 @@ async function fetchMachineCategories(): Promise<MachineCategory[]> {
         _normalised: cat.name.toLowerCase().replace(/[^a-z0-9]/g, ''),
     }));
     _machineCategoryCachedAt = now;
-    return _machineCategoryCache;
+    return _machineCategoryCache as MachineCategory[];
 }
 
 /**
@@ -402,7 +388,7 @@ router.get('/api/machines', async (_req, res) => {
             imageUrl: cat.imageUrl,
             pubNos: cat.pubNos,
         }));
-        return res.json({ machines });
+        return res.json({ count: machines.length, machines });
     } catch (err) {
         console.error('machines: BC category fetch failed:', (err as Error).message);
         return res.status(500).json({ error: 'Could not load machine list.' });
@@ -436,11 +422,11 @@ interface RawMachine {
     status?: string;
 }
 
-router.get('/customer/:customerId/machines', async (req: Request, res: Response, next: NextFunction) => {
-    const customerId = req.params.customerId as string;
+router.get('/api/customer/:customerId/machines', async (req, res) => {
+    const { customerId } = req.params;
 
     if (!customerId || !/^\d+$/.test(customerId)) {
-        return next(new AppError('Invalid customerId.', 400));
+        return res.status(400).json({ error: 'Invalid customerId.' });
     }
 
     try {
@@ -462,7 +448,7 @@ router.get('/customer/:customerId/machines', async (req: Request, res: Response,
         try {
             rawMachines = JSON.parse(rmField.value) as RawMachine[];
         } catch {
-            logger.error(`customer ${customerId}: registered_machines metafield is not valid JSON`);
+            console.error(`customer ${customerId}: registered_machines metafield is not valid JSON`);
             return res.json({ machines: [] });
         }
 
@@ -470,8 +456,15 @@ router.get('/customer/:customerId/machines', async (req: Request, res: Response,
             return res.json({ machines: [] });
         }
 
+        const seenSerials = new Set<string>();
         const machines = rawMachines
             .filter(m => m.status !== 'Inactive')
+            .filter(m => {
+                const serial = m.serial ?? '';
+                if (!serial || seenSerials.has(serial)) return false;
+                seenSerials.add(serial);
+                return true;
+            })
             .map(m => {
                 const cat = matchCategory(m.model, categories);
                 return {
@@ -481,28 +474,30 @@ router.get('/customer/:customerId/machines', async (req: Request, res: Response,
                     status: m.status ?? null,
                     imageUrl: cat ? cat.imageUrl : '',
                     pubNos: cat ? cat.pubNos : [],
+                    hasPartsBook: !!(cat && cat.pubNos.length),
                     machineType: cat ? cat.machineType : null,
                     categoryId: cat ? cat.categoryId : null,
                 };
             });
 
-        return res.json({ machines });
+        return res.json({ count: machines.length, machines });
     } catch (err) {
-        return next(err);
+        console.error(`customer ${customerId}: machine lookup failed:`, (err as Error).message);
+        return res.status(500).json({ error: 'Could not load customer machines.' });
     }
 });
 
-router.get('/parts-book/machine/verify', (req: Request, res: Response, next: NextFunction) => {
+router.get('/api/parts-book/machine/verify', (req, res) => {
     const { serialNo } = req.query;
 
     if (!serialNo) {
-        return next(new AppError('serialNo query parameter is required.', 400));
+        return res.status(400).json({ error: 'serialNo query parameter is required.' });
     }
 
     return res.json({
         verified: true,
         model: 'LU300-M',
-        serialNo: String(serialNo),
+        serialNo,
         stockCondition: 'Active',
     });
 });
