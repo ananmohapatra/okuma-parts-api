@@ -473,23 +473,25 @@ router.get('/customer/:customerId/header-context', async (req: Request<{ custome
  */
 router.post('/customer/:customerId/machine/select', async (req: Request<{ customerId: string }>, res: Response) => {
     const { customerId } = req.params;
-    const { serial } = req.body as { serial?: string };
+    const { serialNumber, model } = req.body as { serialNumber?: string; model?: string };
 
     if (!customerId || !/^\d+$/.test(customerId)) {
         return res.status(400).json({ error: 'Invalid customerId.' });
     }
-    if (!serial || typeof serial !== 'string' || !serial.trim()) {
-        return res.status(400).json({ error: 'serial is required.' });
+    if (!serialNumber || typeof serialNumber !== 'string' || !serialNumber.trim()) {
+        return res.status(400).json({ error: 'serialNumber is required.' });
     }
 
     try {
         const meta = await fetchOkumaMetafields(customerId);
         const machines = parseMachines(meta.registered_machines);
-        const machine = machines.find(m => m.serial === serial.trim());
+        const machine = machines.find(
+            m => m.serial === serialNumber.trim() && (model ? m.model === model.trim() : true)
+        );
 
         if (!machine) {
             return res.status(404).json({
-                error: `Machine with serial '${serial}' not found in customer's assigned machines.`,
+                error: `Machine with serialNumber '${serialNumber}'${model ? ` and model '${model}'` : ''} not found in customer's assigned machines.`,
             });
         }
 
@@ -503,6 +505,10 @@ router.post('/customer/:customerId/machine/select', async (req: Request<{ custom
         );
 
         writeSessionState(req, customerId, { selected: machine.serial, recent: updatedRecent });
+
+        const recentMachines = updatedRecent
+            .map(s => machines.find(m => m.serial === s))
+            .filter((m): m is Machine => m !== undefined);
 
         // Persist to BC metafields (fire-and-forget — do not block the response).
         // Pass metafield IDs from the initial fetch to skip a redundant GET per upsert.
@@ -526,7 +532,7 @@ router.post('/customer/:customerId/machine/select', async (req: Request<{ custom
             });
         });
 
-        return res.json({ selectedMachine: machine });
+        return res.json({ selectedMachine: machine, recentMachines });
     } catch (err) {
         logger.error(`customer ${customerId}: machine select failed: ${(err as Error).message}`);
         return res.status(500).json({ error: 'Could not select machine.' });
