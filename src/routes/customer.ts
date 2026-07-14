@@ -775,7 +775,6 @@ router.get('/customer/companyProfile', authenticateBCToken, async (req: Request,
     if (!companyId || !/^\d+$/.test(companyId)) {
         return res.status(400).json({ error: 'Invalid or missing companyId.' });
     }
-
     const cached = getProfileCache(companyId);
     if (cached) {
         logger.debug(`companyProfile cache hit for company ${companyId}`);
@@ -844,4 +843,38 @@ router.get('/customer/companyProfile', authenticateBCToken, async (req: Request,
     }
 });
 
+// GET /v1/customer/:customerId/b2b-token
+// Returns a B2B storefront customer token for use with the B2B Storefront GraphQL API.
+router.get('/customer/:customerId/b2b-token', async (req: Request<{ customerId: string }>, res: Response) => {
+    const { customerId } = req.params;
+
+    if (!customerId || !/^\d+$/.test(customerId)) {
+        return res.status(400).json({ error: 'Invalid customerId.' });
+    }
+
+    try {
+        const tokenRes = await b2bClient.post('/api/io/auth/customers/storefront', {
+            customerId: parseInt(customerId, 10),
+        });
+
+        const raw = tokenRes.data?.data?.token ?? tokenRes.data?.token;
+        const token = Array.isArray(raw) ? raw[0] : raw;
+
+        if (!token) {
+            logger.error(`customer ${customerId}: b2b-token response missing token field`);
+            return res.status(502).json({ error: 'No token returned from B2B.' });
+        }
+
+        return res.json({ token });
+    } catch (err) {
+        const status = (err as { response?: { status?: number } })?.response?.status;
+        if (status === 404) {
+            return res.status(404).json({ error: 'Customer not found in B2B.' });
+        }
+        logger.error(`customer ${customerId}: b2b-token failed: ${(err as Error).message}`);
+        return res.status(500).json({ error: 'Could not generate B2B storefront token.' });
+    }
+});
+
 export default router;
+
