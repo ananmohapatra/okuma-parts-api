@@ -8,6 +8,45 @@ const router = Router();
 
 const RECENT_MACHINES_LIMIT = 3;
 const RECENT_SEARCHES_LIMIT = 3;
+const COMPANY_PROFILE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+// ---------------------------------------------------------------------------
+// Company profile cache
+// ---------------------------------------------------------------------------
+
+interface CompanyProfileData {
+    companyName: string | null;
+    accountNumber: string | null;
+    address: {
+        line1: string;
+        city: string;
+        state: string;
+        zipCode: string;
+        country: string;
+        formatted: string;
+    };
+}
+
+interface CompanyProfileCacheEntry {
+    data: CompanyProfileData;
+    expiresAt: number;
+}
+
+const companyProfileCache = new Map<string, CompanyProfileCacheEntry>();
+
+function getProfileCache(companyId: string): CompanyProfileData | null {
+    const entry = companyProfileCache.get(companyId);
+    if (!entry) return null;
+    if (Date.now() > entry.expiresAt) {
+        companyProfileCache.delete(companyId);
+        return null;
+    }
+    return entry.data;
+}
+
+function setProfileCache(companyId: string, data: CompanyProfileData): void {
+    companyProfileCache.set(companyId, { data, expiresAt: Date.now() + COMPANY_PROFILE_CACHE_TTL_MS });
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -45,21 +84,6 @@ interface BcMetafieldRecord {
     key: string;
     value: string;
     namespace: string;
-}
-
-interface B2BCompanyExtraField {
-    fieldName: string;
-    fieldValue: string | null;
-}
-
-interface B2BCompany {
-    companyName: string | null;
-    addressLine1: string | null;
-    city: string | null;
-    state: string | null;
-    zipCode: string | null;
-    country: string | null;
-    extraFields: B2BCompanyExtraField[];
 }
 
 interface MachineSessionState {
@@ -733,80 +757,91 @@ router.get('/customer/:customerId/metafields', async (req: Request<{ customerId:
     }
 });
 /*
- * GET /customer/:customerId/companyProfile
+ * GET /customer/companyProfile?companyId={companyId}
  *
- * Returns the customer's name, company name, account number, and address.
+ * Returns company name, account number, and default shipping address.
+ * FE supplies companyId directly — no B3 users lookup needed.
  *
- * Call 1 [OOTB B3]: GET /api/v3/io/users?bcCustomerId={id}  → firstName, lastName, companyId
- * Call 2 [OOTB B3]: GET /api/v3/io/companies/{companyId}    → companyName, address, accountNumber
+ * Call A [OOTB B3]: GET /api/v3/io/companies/{companyId}            → companyName, accountNumber
+ * Call B [OOTB B3]: GET /api/v3/io/addresses?companyId={companyId}  → default shipping address
  *
- * Response: { customerName, companyName, accountNumber, address }
+ * Calls A and B run in parallel. Result cached by companyId for 5 minutes.
+ *
+ * Response: { companyName, accountNumber, address }
  */
-router.get(
-    '/customer/:customerId/companyProfile',
-    authenticateBCToken,
-    async (req: Request<{ customerId: string }>, res: Response) => {
-        const { customerId } = req.params;
+router.get('/customer/companyProfile', authenticateBCToken, async (req: Request, res: Response) => {
+    const companyId = req.query.companyId as string | undefined;
 
-        if (!customerId || !/^\d+$/.test(customerId)) {
-            return res.status(400).json({ error: 'Invalid customerId.' });
-        }
-
-        try {
-            // Call 1 — resolve customer name + companyId from B3
-            const usersRes = await b2bClient.get(`/api/v3/io/users?bcCustomerId=${customerId}`);
-            const b3User = usersRes.data?.data?.[0];
-
-            if (!b3User) {
-                return res.status(404).json({ error: 'Customer not found in B2B.' });
-            }
-
-            const { firstName, lastName, companyId } = b3User;
-
-            // Fix #1: guard against missing companyId before calling companies API
-            if (companyId === null || companyId === undefined) {
-                return res.status(404).json({ error: 'Company not found for customer.' });
-            }
-
-            // Call 2 — resolve company details from B3
-            const companyRes = await b2bClient.get<{ data: B2BCompany }>(`/api/v3/io/companies/${companyId}`);
-            const company = companyRes.data?.data;
-
-            if (!company) {
-                return res.status(404).json({ error: 'Company not found.' });
-            }
-
-            const accountNumber = company.extraFields.find(f => f.fieldName === 'Account Number')?.fieldValue ?? null;
-
-            const addressParts = [company.addressLine1, company.city, company.state, company.zipCode, company.country]
-                .map(p => (p ?? '').trim())
-                .filter(Boolean);
-
-            return res.json({
-                // Fix #2: coalesce to empty strings to avoid "undefined"/"null" in response
-                customerName: `${firstName ?? ''} ${lastName ?? ''}`.trim(),
-                companyName: company.companyName ?? null,
-                accountNumber,
-                address: {
-                    line1: company.addressLine1 ?? '',
-                    city: company.city ?? '',
-                    state: company.state ?? '',
-                    zipCode: company.zipCode ?? '',
-                    country: company.country ?? '',
-                    formatted: addressParts.join(', '),
-                },
-            });
-        } catch (err) {
-            // Fix #3: map upstream B2B 404s to 404 instead of 500
-            if ((err as { response?: { status?: number } })?.response?.status === 404) {
-                return res.status(404).json({ error: 'Customer or company not found.' });
-            }
-            logger.error(
-                `customer ${customerId}: companyProfile failed: ${(err as Error)?.message ?? 'Unknown error'}`
-            );
-            return res.status(500).json({ error: 'Could not load company profile.' });
-        }
+    if (!companyId || !/^\d+$/.test(companyId)) {
+        return res.status(400).json({ error: 'Invalid or missing companyId.' });
     }
-);
+
+    const cached = getProfileCache(companyId);
+    if (cached) {
+        logger.debug(`companyProfile cache hit for company ${companyId}`);
+        return res.json(cached);
+    }
+
+    try {
+        const [companyRes, addressesRes] = await Promise.all([
+            b2bClient.get(`/api/v3/io/companies/${companyId}`),
+            b2bClient.get(`/api/v3/io/addresses?companyId=${companyId}`),
+        ]);
+
+        const company = companyRes.data?.data;
+        if (!company) {
+            return res.status(404).json({ error: 'Company not found.' });
+        }
+
+        const accountNumber =
+            (company.extraFields ?? []).find(
+                (f: { fieldName: string; fieldValue: string | null }) => f.fieldName === 'Account Number'
+            )?.fieldValue ?? null;
+
+        interface B3Address {
+            addressLine1: string;
+            city: string;
+            stateName: string;
+            zipCode: string;
+            countryName: string;
+            isDefaultShipping: boolean;
+        }
+
+        const addresses: B3Address[] = addressesRes.data?.data ?? [];
+        const defaultShipping = addresses.find(a => a.isDefaultShipping === true) ?? addresses[0] ?? null;
+
+        const addressParts = [
+            defaultShipping?.addressLine1,
+            defaultShipping?.city,
+            defaultShipping?.stateName,
+            defaultShipping?.zipCode,
+            defaultShipping?.countryName,
+        ]
+            .map(p => (p ?? '').trim())
+            .filter(Boolean);
+
+        const profile: CompanyProfileData = {
+            companyName: company.companyName ?? null,
+            accountNumber,
+            address: {
+                line1: defaultShipping?.addressLine1 ?? '',
+                city: defaultShipping?.city ?? '',
+                state: defaultShipping?.stateName ?? '',
+                zipCode: defaultShipping?.zipCode ?? '',
+                country: defaultShipping?.countryName ?? '',
+                formatted: addressParts.join(', '),
+            },
+        };
+
+        setProfileCache(companyId, profile);
+        return res.json(profile);
+    } catch (err) {
+        if ((err as { response?: { status?: number } })?.response?.status === 404) {
+            return res.status(404).json({ error: 'Company not found.' });
+        }
+        logger.error(`companyProfile failed for company ${companyId}: ${(err as Error)?.message ?? 'Unknown error'}`);
+        return res.status(500).json({ error: 'Could not load company profile.' });
+    }
+});
 
 export default router;
