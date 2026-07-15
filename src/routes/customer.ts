@@ -63,6 +63,7 @@ interface Machine {
 interface OkumaMetafields {
     registered_customers?: string;
     dealer_id?: string;
+    job_title?: string;
     last_viewed_machine?: string; // serial of the last explicitly selected machine
     recent_machines?: string; // JSON array of serials, most-recent first (capped at 3)
     recent_customer_searches?: string; // JSON array of search strings, most-recent first (capped at 10)
@@ -185,13 +186,18 @@ interface B2BMachineRecord {
  * Resolves: BC email → B2B user → companyId → company extraFields → Machines JSON.
  * Returns an empty array on any lookup failure.
  */
-async function fetchB2BMachines(email: string): Promise<Machine[]> {
+interface B2BMachinesResult {
+    machines: Machine[];
+    companyId: number | null;
+}
+
+async function fetchB2BMachines(email: string): Promise<B2BMachinesResult> {
     try {
         const usersRes = await b2bClient.get<{ data: Array<{ companyId?: number }> }>('/api/v3/io/users', {
             params: { email },
         });
-        const companyId = usersRes.data?.data?.[0]?.companyId;
-        if (!companyId) return [];
+        const companyId = usersRes.data?.data?.[0]?.companyId ?? null;
+        if (!companyId) return { machines: [], companyId: null };
 
         const companyRes = await b2bClient.get<{
             data: { extraFields?: Array<{ fieldName: string; fieldValue: string }> };
@@ -199,7 +205,7 @@ async function fetchB2BMachines(email: string): Promise<Machine[]> {
         const machinesField = (companyRes.data?.data?.extraFields ?? []).find(
             f => f.fieldName.toLowerCase() === 'machines'
         );
-        if (!machinesField) return [];
+        if (!machinesField) return { machines: [], companyId };
 
         let raw: B2BMachineRecord[];
         try {
@@ -208,18 +214,36 @@ async function fetchB2BMachines(email: string): Promise<Machine[]> {
             raw = Array.isArray(parsed) ? parsed : (parsed?.machines ?? []);
         } catch {
             logger.warn(`fetchB2BMachines: Machines field for company ${companyId} is not valid JSON`);
-            return [];
+            return { machines: [], companyId };
+        }
+
+        logger.debug(
+            `fetchB2BMachines company ${companyId}: raw=${raw.length} records — ${raw
+                .map(m => `[model=${m.modelNo ?? '?'} serial=${m.serialNo ?? '(empty)'} status=${m.status ?? 'null'}]`)
+                .join(', ')}`
+        );
+
+        const afterStatus = raw.filter(m => m.status?.toLowerCase() !== 'inactive');
+        if (afterStatus.length !== raw.length) {
+            logger.warn(
+                `fetchB2BMachines company ${companyId}: dropped ${raw.length - afterStatus.length} inactive machines`
+            );
         }
 
         const seenSerials = new Set<string>();
-        return raw
-            .filter(m => m.status !== 'Inactive')
-            .filter(m => {
-                const serial = m.serialNo ?? '';
-                if (!serial || seenSerials.has(serial)) return false;
-                seenSerials.add(serial);
-                return true;
-            })
+        const afterSerial = afterStatus.filter(m => {
+            const serial = (m.serialNo ?? '').trim();
+            if (!serial || seenSerials.has(serial)) return false;
+            seenSerials.add(serial);
+            return true;
+        });
+        if (afterSerial.length !== afterStatus.length) {
+            logger.warn(
+                `fetchB2BMachines company ${companyId}: dropped ${afterStatus.length - afterSerial.length} machines with missing/duplicate serialNo`
+            );
+        }
+
+        const machines = afterSerial
             .map(m => ({
                 model: m.modelNo ?? '',
                 serial: m.serialNo ?? '',
@@ -231,28 +255,10 @@ async function fetchB2BMachines(email: string): Promise<Machine[]> {
                 const cmp = a.model.localeCompare(b.model);
                 return cmp !== 0 ? cmp : a.serial.localeCompare(b.serial);
             });
+        return { machines, companyId };
     } catch (err) {
         logger.warn(`fetchB2BMachines: ${(err as Error).message}`);
-        return [];
-    }
-}
-
-/**
- * Fetch job title from BC customer form field values.
- * BC OOTB: GET /v3/customers/form-field-values?customer_id:in=:customerId
- * Matches any field whose name normalises to "jobtitle".
- */
-async function fetchCustomerJobTitle(customerId: string): Promise<string | null> {
-    try {
-        const res = await bcClient.get<{ data: Array<{ name: string; value: string }> }>(
-            '/v3/customers/form-field-values',
-            { params: { 'customer_id:in': customerId } }
-        );
-        const field = (res.data?.data ?? []).find(f => f.name?.toLowerCase().replace(/[\s_-]/g, '') === 'jobtitle');
-        return field?.value ?? null;
-    } catch (err) {
-        logger.warn(`fetchCustomerJobTitle ${customerId}: ${(err as Error).message}`);
-        return null;
+        return { machines: [], companyId: null };
     }
 }
 
@@ -470,7 +476,7 @@ router.get('/customer/:customerId/machines', async (req: Request<{ customerId: s
 
     try {
         const profile = await fetchCustomerProfile(customerId);
-        const machines = profile?.email ? await fetchB2BMachines(profile.email) : [];
+        const { machines } = profile?.email ? await fetchB2BMachines(profile.email) : { machines: [] };
         return res.json({ count: machines.length, machines });
     } catch (err) {
         logger.error(`customer ${customerId}: machines fetch failed: ${(err as Error).message}`);
@@ -506,20 +512,20 @@ router.get('/customer/:customerId/header-context', async (req: Request<{ custome
     }
 
     try {
-        const [meta, profile, jobTitle] = await Promise.all([
-            fetchOkumaMetafields(customerId),
-            fetchCustomerProfile(customerId),
-            fetchCustomerJobTitle(customerId),
-        ]);
+        const [meta, profile] = await Promise.all([fetchOkumaMetafields(customerId), fetchCustomerProfile(customerId)]);
+        const jobTitle = meta.job_title ?? null;
 
         if (meta.registered_customers !== undefined) {
             return res.json({ isDealer: true });
         }
 
-        const [machines, dealerName] = await Promise.all([
-            profile?.email ? fetchB2BMachines(profile.email) : Promise.resolve([]),
+        const [b2bResult, dealerName] = await Promise.all([
+            profile?.email
+                ? fetchB2BMachines(profile.email)
+                : Promise.resolve({ machines: [] as Machine[], companyId: null }),
             profile?.customer_group_id ? fetchCustomerGroupName(profile.customer_group_id) : Promise.resolve(null),
         ]);
+        const { machines, companyId } = b2bResult;
 
         // readSessionState never mutates req.session — avoids a store write on every GET
         const sessionState = readSessionState(req, customerId);
@@ -539,6 +545,7 @@ router.get('/customer/:customerId/header-context', async (req: Request<{ custome
                       lastName: profile.last_name,
                       email: profile.email,
                       company: profile.company || null,
+                      companyId,
                       phone: profile.phone || null,
                       jobTitle,
                   }
@@ -578,7 +585,7 @@ router.post('/customer/:customerId/machine/select', async (req: Request<{ custom
 
     try {
         const [meta, profile] = await Promise.all([fetchOkumaMetafields(customerId), fetchCustomerProfile(customerId)]);
-        const machines = profile?.email ? await fetchB2BMachines(profile.email) : [];
+        const { machines } = profile?.email ? await fetchB2BMachines(profile.email) : { machines: [] as Machine[] };
         const machine = machines.find(m => m.serial === serial.trim() && (model ? m.model === model.trim() : true));
 
         if (!machine) {
@@ -775,6 +782,7 @@ router.get('/customer/companyProfile', authenticateBCToken, async (req: Request,
     if (!companyId || !/^\d+$/.test(companyId)) {
         return res.status(400).json({ error: 'Invalid or missing companyId.' });
     }
+
     const cached = getProfileCache(companyId);
     if (cached) {
         logger.debug(`companyProfile cache hit for company ${companyId}`);
@@ -877,4 +885,3 @@ router.get('/customer/:customerId/b2b-token', async (req: Request<{ customerId: 
 });
 
 export default router;
-
