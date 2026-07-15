@@ -189,6 +189,7 @@ interface B2BMachineRecord {
 interface B2BMachinesResult {
     machines: Machine[];
     companyId: number | null;
+    accountNumber: string | null;
 }
 
 async function fetchB2BMachines(email: string): Promise<B2BMachinesResult> {
@@ -197,15 +198,15 @@ async function fetchB2BMachines(email: string): Promise<B2BMachinesResult> {
             params: { email },
         });
         const companyId = usersRes.data?.data?.[0]?.companyId ?? null;
-        if (!companyId) return { machines: [], companyId: null };
+        if (!companyId) return { machines: [], companyId: null, accountNumber: null };
 
         const companyRes = await b2bClient.get<{
             data: { extraFields?: Array<{ fieldName: string; fieldValue: string }> };
         }>(`/api/v3/io/companies/${companyId}`);
-        const machinesField = (companyRes.data?.data?.extraFields ?? []).find(
-            f => f.fieldName.toLowerCase() === 'machines'
-        );
-        if (!machinesField) return { machines: [], companyId };
+        const extraFields = companyRes.data?.data?.extraFields ?? [];
+        const machinesField = extraFields.find(f => f.fieldName.toLowerCase() === 'machines');
+        const accountNumber = extraFields.find(f => f.fieldName.toLowerCase() === 'account number')?.fieldValue ?? null;
+        if (!machinesField) return { machines: [], companyId, accountNumber };
 
         let raw: B2BMachineRecord[];
         try {
@@ -214,7 +215,7 @@ async function fetchB2BMachines(email: string): Promise<B2BMachinesResult> {
             raw = Array.isArray(parsed) ? parsed : (parsed?.machines ?? []);
         } catch {
             logger.warn(`fetchB2BMachines: Machines field for company ${companyId} is not valid JSON`);
-            return { machines: [], companyId };
+            return { machines: [], companyId, accountNumber };
         }
 
         logger.debug(
@@ -255,10 +256,10 @@ async function fetchB2BMachines(email: string): Promise<B2BMachinesResult> {
                 const cmp = a.model.localeCompare(b.model);
                 return cmp !== 0 ? cmp : a.serial.localeCompare(b.serial);
             });
-        return { machines, companyId };
+        return { machines, companyId, accountNumber };
     } catch (err) {
         logger.warn(`fetchB2BMachines: ${(err as Error).message}`);
-        return { machines: [], companyId: null };
+        return { machines: [], companyId: null, accountNumber: null };
     }
 }
 
@@ -522,10 +523,10 @@ router.get('/customer/:customerId/header-context', async (req: Request<{ custome
         const [b2bResult, dealerName] = await Promise.all([
             profile?.email
                 ? fetchB2BMachines(profile.email)
-                : Promise.resolve({ machines: [] as Machine[], companyId: null }),
+                : Promise.resolve({ machines: [] as Machine[], companyId: null, accountNumber: null }),
             profile?.customer_group_id ? fetchCustomerGroupName(profile.customer_group_id) : Promise.resolve(null),
         ]);
-        const { machines, companyId } = b2bResult;
+        const { machines, companyId, accountNumber } = b2bResult;
 
         // readSessionState never mutates req.session — avoids a store write on every GET
         const sessionState = readSessionState(req, customerId);
@@ -546,6 +547,7 @@ router.get('/customer/:customerId/header-context', async (req: Request<{ custome
                       email: profile.email,
                       company: profile.company || null,
                       companyId,
+                      accountNumber,
                       phone: profile.phone || null,
                       jobTitle,
                   }
