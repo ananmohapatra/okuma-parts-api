@@ -22,8 +22,6 @@ const STATUS_MAP: Record<number, string> = {
     14: 'Partially Refunded',
 };
 
-const OPEN_STATUS_IDS = new Set([1, 7, 8, 9, 11, 12]);
-
 const METAFIELD_NAMESPACE = 'okuma';
 const METAFIELD_KEY = 'dealer_customer_ids';
 const CACHE_TTL_HOURS = 24;
@@ -191,7 +189,7 @@ router.get('/recent-orders', async (req: Request, res: Response) => {
         allOrders.sort((a, b) => new Date(b.date_created).getTime() - new Date(a.date_created).getTime());
 
         const totalOrderCount = allOrders.length;
-        const openOrderCount = allOrders.filter(o => OPEN_STATUS_IDS.has(o.status_id)).length;
+        const openOrderCount = allOrders.filter(o => o.status_id === 1).length;
 
         const recentOrders = allOrders.slice(0, limit).map(o => ({
             orderId: o.id,
