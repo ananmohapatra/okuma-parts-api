@@ -75,6 +75,7 @@ interface B2BCompany {
     companyId: number;
     companyName: string;
     companyEmail: string;
+    bcGroupName?: string;
     parentCompany: {
         id: number | null;
         name: string;
@@ -355,6 +356,30 @@ async function fetchCustomerIdsFromHierarchy(dealerEmail: string): Promise<Deale
 }
 
 // ---------------------------------------------------------------------------
+// B2B company-group helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch all B2B companies whose bcGroupName exactly matches the supplied name.
+ * The B2B API has no server-side filter for this field, so all pages are fetched
+ * and filtered client-side.
+ */
+async function fetchB2BCompaniesByGroupName(groupName: string): Promise<B2BCompany[]> {
+    const all = await collectPages(async off => {
+        try {
+            const res = await b2bClient.get<B2BPage<B2BCompany>>('/api/v3/io/companies', {
+                params: { limit: B2B_PAGE_LIMIT, offset: off },
+            });
+            return res.data?.data ?? [];
+        } catch (err) {
+            logger.error(`B2B companies fetch failed: ${(err as Error).message}`);
+            throw err;
+        }
+    });
+    return all.filter(c => c.bcGroupName === groupName);
+}
+
+// ---------------------------------------------------------------------------
 // Recent-search helpers
 // ---------------------------------------------------------------------------
 
@@ -425,24 +450,22 @@ async function upsertRecentCustomerSearches(
 /**
  * GET /v1/api/dealers/context?email=<dealerEmail>
  *
- * Looks up a dealer by email address and returns their profile together with
- * all customers found under their subsidiaries in the B2B hierarchy.
+ * Looks up a dealer by email, resolves their BC customer group by matching the
+ * dealer's company name against BC customer groups, then finds all B2B companies
+ * whose bcGroupName equals that group name, collects their users' BC customer IDs,
+ * and returns the enriched customer list.
  *
- * B2B hierarchy calls:
- *   [1] GET /api/v3/io/users?email=<email>                  → dealer's B2B companyId
- *   [2] GET /api/v3/io/companies (paginated)               → subsidiaries filtered by parentCompany.id
- *   [3] GET /api/v3/io/users?companyId=<id> (paginated)    → BC customer IDs
- *
- * BC OOTB calls:
- *   [4] GET /v3/customers?email:in=<email>&limit=1         → dealer customer record
- *   [5] GET /v3/customers?id:in=<customerIds>&limit=250    → customer profiles
- *   [6] GET /api/v3/io/companies/{id} ×subsidiaries (batched 5) → company Machines extra field
- *   [7] GET /v2/customer_groups                                  → group names (cached 5 min)
+ * Calls:
+ *   [1] GET /v3/customers?email:in=<email>&limit=1                    → dealer record
+ *   [2] GET /v2/customer_groups                                        → group map (cached 5 min)
+ *   [3] GET /api/v3/io/companies (paginated, filtered by bcGroupName)  → matching B2B companies
+ *   [4] GET /api/v3/io/users?companyId=<id> ×companies (batched 5)    → BC customer IDs
+ *   [5] GET /v3/customers?id:in=<ids>&limit=250                        → customer profiles
  *
  * Response:
  * {
  *   dealer:    { id, firstName, lastName, email, company },
- *   customers: [{ id, email, firstName, lastName, customerGroup, dateCreated, dateModified, registeredMachines }],
+ *   customers: [{ id, companyName }],
  *   meta:      { totalCustomerIds, returnedCustomerIds, truncated }
  * }
  */
@@ -459,8 +482,15 @@ router.get('/dealers/context', async (req, res) => {
 
     const emailNorm = email.trim().toLowerCase();
 
+    const emptyResponse = (dealerRecord: BcCustomer) =>
+        res.json({
+            dealer: buildDealerSummary(dealerRecord),
+            customers: [],
+            meta: { totalCustomerIds: 0, returnedCustomerIds: 0, truncated: false },
+        });
+
     try {
-        // -- 1. Look up dealer BC record (identity only — not for customer list) --
+        // -- 1. Dealer lookup --
         const dealerLookup = await bcClient.get<{ data: BcCustomer[] }>('/v3/customers', {
             params: { 'email:in': emailNorm, limit: 1 },
         });
@@ -470,25 +500,59 @@ router.get('/dealers/context', async (req, res) => {
             return res.status(404).json({ error: 'No customer found for the supplied email.' });
         }
 
-        // -- 2. Resolve customer IDs from B2B hierarchy --
-        const { customerIds, totalCustomerIds, truncated } = await fetchCustomerIdsFromHierarchy(emailNorm);
+        const companyName = dealerRecord.company?.trim();
 
-        if (customerIds.length === 0) {
-            return res.json({
-                dealer: buildDealerSummary(dealerRecord),
-                customers: [],
-                meta: { totalCustomerIds, returnedCustomerIds: 0, truncated },
-            });
+        if (!companyName) {
+            logger.warn(`dealer context: ${emailNorm} has no company name`);
+            return emptyResponse(dealerRecord);
         }
 
-        // -- 3. Fetch customer profiles to get company names --
-        const customersRes = await bcClient.get<{ data: BcCustomer[] }>('/v3/customers', {
-            params: { 'id:in': customerIds.join(','), limit: BC_CUSTOMER_FILTER_LIMIT },
+        // -- 2. Confirm a BC customer group with this name exists --
+        const groupMap = await fetchCustomerGroupMap();
+        const groupExists = Object.values(groupMap).some(name => name === companyName);
+
+        if (!groupExists) {
+            logger.warn(`dealer context: no BC customer group matching "${companyName}"`);
+            return emptyResponse(dealerRecord);
+        }
+
+        // -- 3. Find all B2B companies linked to this customer group --
+        const b2bCompanies = await fetchB2BCompaniesByGroupName(companyName);
+
+        if (b2bCompanies.length === 0) {
+            logger.warn(`dealer context: no B2B companies with bcGroupName "${companyName}"`);
+            return emptyResponse(dealerRecord);
+        }
+
+        // -- 4. Collect BC customer IDs from each company's users (batched) --
+        const usersPerCompany = await batchedMap(b2bCompanies, company => fetchB2BCompanyUsers(company.companyId), 5);
+
+        const seen = new Set<number>();
+        const customerIds: number[] = [];
+
+        usersPerCompany.forEach(users => {
+            users.forEach(user => {
+                if (user.customerId > 0 && !seen.has(user.customerId)) {
+                    seen.add(user.customerId);
+                    customerIds.push(user.customerId);
+                }
+            });
         });
 
-        const bcCustomers = customersRes.data?.data ?? [];
+        if (customerIds.length === 0) {
+            return emptyResponse(dealerRecord);
+        }
 
-        const customers = bcCustomers.map(c => ({
+        // -- 5. Fetch BC customer profiles --
+        const totalCustomerIds = customerIds.length;
+        const truncated = totalCustomerIds > BC_CUSTOMER_FILTER_LIMIT;
+        const idsToFetch = customerIds.slice(0, BC_CUSTOMER_FILTER_LIMIT);
+
+        const customersRes = await bcClient.get<{ data: BcCustomer[] }>('/v3/customers', {
+            params: { 'id:in': idsToFetch.join(','), limit: BC_CUSTOMER_FILTER_LIMIT },
+        });
+
+        const customers = (customersRes.data?.data ?? []).map((c: BcCustomer) => ({
             id: c.id,
             companyName: c.company || null,
         }));
@@ -496,7 +560,7 @@ router.get('/dealers/context', async (req, res) => {
         return res.json({
             dealer: buildDealerSummary(dealerRecord),
             customers,
-            meta: { totalCustomerIds, returnedCustomerIds: customerIds.length, truncated },
+            meta: { totalCustomerIds, returnedCustomerIds: customers.length, truncated },
         });
     } catch (err) {
         logger.error(`dealer context lookup for ${emailNorm} failed: ${(err as Error).message}`);
