@@ -13,22 +13,27 @@ const router = Router();
 // ---------------------------------------------------------------------------
 
 interface TocSheet {
-    id: string;
+    id?: string;
     slug: string;
     label: string;
     sheet_number: number;
     assembly_image?: string;
+    table_image?: string;
     parts_json: string;
 }
 
 interface TocAssembly {
     slug: string;
+    label?: string;
+    assembly_json?: string;
     overview_image?: string;
     sheets: TocSheet[];
+    subassemblies?: TocAssembly[];
 }
 
 interface TocDocument {
     id: string;
+    label?: string;
     overview_image?: string;
     category_id?: number;
     assemblies: TocAssembly[];
@@ -39,14 +44,19 @@ interface Toc {
 }
 
 interface RawPart {
+    box_id?: string;
     callout_number?: unknown;
+    callout_instance_index?: number;
     sheet_item?: unknown;
+    item_number?: number;
     part_no?: string;
     description?: string;
     unit_no?: unknown;
     qty?: unknown;
     callout_box_2d?: number[];
+    table_row_box_2d?: number[];
     has_table_match?: boolean;
+    matching_table_row_count?: number;
 }
 
 interface PartsData {
@@ -87,24 +97,29 @@ async function fetchDataJson<T>(relativePath: string): Promise<T | null> {
     }
 }
 
+function rewriteAssembly(assembly: TocAssembly, rewrite: (p: string) => string): TocAssembly {
+    const sheets = assembly.sheets.map(sheet => ({
+        ...sheet,
+        assembly_image: sheet.assembly_image ? rewrite(sheet.assembly_image) : sheet.assembly_image,
+        table_image: sheet.table_image ? rewrite(sheet.table_image) : sheet.table_image,
+    }));
+
+    const subassemblies = (assembly.subassemblies ?? []).map(sub => rewriteAssembly(sub, rewrite));
+
+    return {
+        ...assembly,
+        overview_image: assembly.overview_image ? rewrite(assembly.overview_image) : assembly.overview_image,
+        sheets,
+        ...(subassemblies.length > 0 ? { subassemblies } : {}),
+    };
+}
+
 function rewriteTocImagePaths(toc: Toc): Toc {
     const cdnBase = config.partsBook.cdnBaseUrl;
     const rewrite = (relPath: string) => `${cdnBase}/${relPath}`;
 
     const documents = toc.documents.map(doc => {
-        const assemblies = doc.assemblies.map(assembly => {
-            const sheets = assembly.sheets.map(sheet => ({
-                ...sheet,
-                assembly_image: sheet.assembly_image ? rewrite(sheet.assembly_image) : sheet.assembly_image,
-            }));
-
-            return {
-                ...assembly,
-                overview_image: assembly.overview_image ? rewrite(assembly.overview_image) : assembly.overview_image,
-                sheets,
-            };
-        });
-
+        const assemblies = doc.assemblies.map(asm => rewriteAssembly(asm, rewrite));
         return {
             ...doc,
             overview_image: doc.overview_image ? rewrite(doc.overview_image) : doc.overview_image,
@@ -113,6 +128,14 @@ function rewriteTocImagePaths(toc: Toc): Toc {
     });
 
     return { ...toc, documents };
+}
+
+function findAssemblyBySlug(assemblies: TocAssembly[], slug: string): TocAssembly | null {
+    return assemblies.reduce<TocAssembly | null>((found, asm) => {
+        if (found) return found;
+        if (asm.slug === slug) return asm;
+        return findAssemblyBySlug(asm.subassemblies ?? [], slug);
+    }, null);
 }
 
 function boxToPercent(box: number[]): { calloutX: number; calloutY: number } | null {
@@ -143,11 +166,33 @@ router.get('/parts-book/toc', async (_req: Request, res: Response, next: NextFun
     }
 });
 
+// GET /v1/api/parts-book/toc/:pdfId — single document
+router.get('/parts-book/toc/:pdfId', async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const { pdfId } = req.params;
+
+        const toc = await fetchDataJson<Toc>('toc.json');
+        if (!toc) {
+            return next(new AppError('Table of contents not available.', 500));
+        }
+
+        const doc = toc.documents.find(d => d.id === pdfId);
+        if (!doc) {
+            return next(new NotFoundError(`Document '${pdfId}' not found.`));
+        }
+
+        const rewritten = rewriteTocImagePaths({ documents: [doc] });
+        return res.json(rewritten.documents[0]);
+    } catch (err) {
+        return next(err);
+    }
+});
+
 router.get(
     '/parts-book/sheets/:pdfId/:assemblySlug/:sheetSlug/parts',
     async (req: Request, res: Response, next: NextFunction) => {
         try {
-            const { pdfId, assemblySlug, sheetSlug } = req.params;
+            const { pdfId, assemblySlug, sheetSlug } = req.params as Record<string, string>;
 
             const toc = await fetchDataJson<Toc>('toc.json');
             if (!toc) {
@@ -159,7 +204,7 @@ router.get(
                 return next(new NotFoundError(`Document '${pdfId}' not found.`));
             }
 
-            const assembly = doc.assemblies.find(a => a.slug === assemblySlug);
+            const assembly = findAssemblyBySlug(doc.assemblies, assemblySlug);
             if (!assembly) {
                 return next(new NotFoundError(`Assembly '${assemblySlug}' not found.`));
             }
@@ -206,10 +251,14 @@ router.get(
             const parts = rawParts.map(p => {
                 const coords = p.callout_box_2d != null ? boxToPercent(p.callout_box_2d) : null;
                 const { calloutX = null, calloutY = null } = coords ?? {};
+                const tableCoords = p.table_row_box_2d != null ? boxToPercent(p.table_row_box_2d) : null;
                 const bc = p.part_no ? (bcLookup[p.part_no] ?? null) : null;
 
                 return {
+                    boxId: p.box_id ?? null,
                     calloutNumber: p.callout_number,
+                    calloutInstanceIndex: p.callout_instance_index ?? 1,
+                    itemNumber: p.item_number ?? null,
                     sheetItem: p.sheet_item,
                     partNo: p.part_no,
                     description: p.description,
@@ -217,10 +266,13 @@ router.get(
                     qty: p.qty,
                     calloutX,
                     calloutY,
+                    tableRowX: tableCoords?.calloutX ?? null,
+                    tableRowY: tableCoords?.calloutY ?? null,
+                    hasTableMatch: p.has_table_match === true,
+                    matchingTableRowCount: p.matching_table_row_count ?? null,
                     price: bc ? bc.price : null,
                     inStock: bc ? bc.inStock : false,
                     productId: bc ? bc.productId : null,
-                    hasTableMatch: p.has_table_match === true,
                 };
             });
 
@@ -228,10 +280,11 @@ router.get(
 
             return res.json({
                 sheet: {
-                    id: sheet.id,
+                    id: sheet.id ?? sheet.slug,
                     label: sheet.label,
                     sheetNumber: sheet.sheet_number,
                     diagramUrl: sheet.assembly_image ? `${cdnBase}/${sheet.assembly_image}` : null,
+                    tableUrl: sheet.table_image ? `${cdnBase}/${sheet.table_image}` : null,
                 },
                 parts,
             });

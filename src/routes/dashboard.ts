@@ -22,8 +22,6 @@ const STATUS_MAP: Record<number, string> = {
     14: 'Partially Refunded',
 };
 
-const OPEN_STATUS_IDS = new Set([1, 7, 8, 9, 11, 12]);
-
 const METAFIELD_NAMESPACE = 'okuma';
 const METAFIELD_KEY = 'dealer_customer_ids';
 const CACHE_TTL_HOURS = 24;
@@ -71,6 +69,7 @@ interface BcOrder {
     items_total: number;
     total_inc_tax: number;
     currency_code: string;
+    is_deleted: boolean;
 }
 
 interface B2BQuoteExtraField {
@@ -172,7 +171,7 @@ router.get('/recent-orders', async (req: Request, res: Response) => {
                 customerIds,
                 id =>
                     bcClient
-                        .get(`/v2/orders?customer_id=${id}&sort=date_created:desc&limit=250`)
+                        .get(`/v2/orders?customer_id=${id}&sort=date_created:desc&limit=250&is_deleted=false`)
                         .then(r => (Array.isArray(r.data) ? r.data : []))
                         .catch(() => []),
                 10
@@ -184,14 +183,14 @@ router.get('/recent-orders', async (req: Request, res: Response) => {
 
         const customerNameMap: Record<number, string> = {};
         ((customersRes.data.data as BcCustomerRow[]) ?? []).forEach(c => {
-            customerNameMap[c.id] = `${c.first_name ?? ''} ${c.last_name ?? ''}`.trim() || 'Customer';
+            customerNameMap[c.id] = c.company || `${c.first_name ?? ''} ${c.last_name ?? ''}`.trim() || 'Customer';
         });
 
-        const allOrders = orderResults.flat().filter(Boolean) as BcOrder[];
+        const allOrders = (orderResults.flat().filter(Boolean) as BcOrder[]).filter(o => !o.is_deleted);
         allOrders.sort((a, b) => new Date(b.date_created).getTime() - new Date(a.date_created).getTime());
 
         const totalOrderCount = allOrders.length;
-        const openOrderCount = allOrders.filter(o => OPEN_STATUS_IDS.has(o.status_id)).length;
+        const openOrderCount = allOrders.filter(o => o.status_id === 1).length;
 
         const recentOrders = allOrders.slice(0, limit).map(o => ({
             orderId: o.id,
