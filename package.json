@@ -22,7 +22,7 @@
     "format:check": "prettier --check 'src/**/*.ts'",
     "test": "jest",
     "test:coverage": "jest --coverage",
-    "prepare": "cd .. && git config core.hooksPath .husky"
+    "prepare": "cd .. && git rev-parse --git-dir > /dev/null 2>&1 && git config core.hooksPath .husky || true"
   },
   "dependencies": {
     "axios": "^1.7.2",
