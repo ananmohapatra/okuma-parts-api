@@ -443,14 +443,20 @@ router.get('/customer/:customerId/header-context', async (req: Request<{ custome
 
         // relationshipType from B2B company extra fields identifies account type
         const isDealer = relationshipType?.toLowerCase() === 'distributor';
-        if (isDealer) {
-            return res.json({ isDealer: true });
-        }
 
-        // Resolve distributor name from the company whose Account Number = distributorId
-        const distributor = distributorId ? await fetchDistributorByAccountNumber(distributorId) : null;
-        const dealerId = distributorId ?? null;
-        const dealerName = distributor?.companyName ?? null;
+        // Dealers ARE the distributor — their dealerId is their own accountNumber and
+        // dealerName is their own company. Non-dealers look up their parent distributor.
+        let dealerId: string | null;
+        let dealerName: string | null;
+        if (isDealer) {
+            dealerId = accountNumber ?? null;
+            const ownCompany = accountNumber ? await fetchDistributorByAccountNumber(accountNumber) : null;
+            dealerName = ownCompany?.companyName ?? null;
+        } else {
+            const distributor = distributorId ? await fetchDistributorByAccountNumber(distributorId) : null;
+            dealerId = distributorId ?? null;
+            dealerName = distributor?.companyName ?? null;
+        }
 
         // readSessionState never mutates req.session — avoids a store write on every GET
         const sessionState = readSessionState(req, customerId);
@@ -467,7 +473,7 @@ router.get('/customer/:customerId/header-context', async (req: Request<{ custome
             .filter((m): m is Machine => m !== undefined);
 
         return res.json({
-            isDealer: false,
+            isDealer,
             customer: profile
                 ? {
                       firstName: profile.first_name,
