@@ -1,7 +1,11 @@
 import { Router } from 'express';
 import bcClient from '../services/bigcommerce';
 import b2bClient from '../services/b2b';
-import { fetchB2BUserByEmail, buildExtraFieldsMap, upsertB2BUserExtraField } from '../services/b2b-user';
+import {
+    fetchB2BCompanyByUserEmail,
+    buildCompanyExtraFieldsMap,
+    upsertB2BCompanyExtraField,
+} from '../services/b2b-company';
 import logger from '../config/logger';
 
 const router = Router();
@@ -387,17 +391,17 @@ async function upsertRecentCustomerSearches(
     dealerEmail: string,
     newEntry: RecentCustomerSearch
 ): Promise<RecentCustomerSearch[]> {
-    const b2bUser = await fetchB2BUserByEmail(dealerEmail);
-    const extraFieldsMap = buildExtraFieldsMap(b2bUser?.extraFields);
+    const company = await fetchB2BCompanyByUserEmail(dealerEmail);
+    const companyExtraFields = buildCompanyExtraFieldsMap(company?.extraFields);
 
     let current: RecentCustomerSearch[] = [];
-    if (extraFieldsMap.recent_customer_searches) {
+    if (companyExtraFields.recent_customer_searches) {
         try {
-            const parsed = JSON.parse(extraFieldsMap.recent_customer_searches);
+            const parsed = JSON.parse(companyExtraFields.recent_customer_searches);
             if (Array.isArray(parsed)) current = parsed as RecentCustomerSearch[];
         } catch {
             logger.warn(
-                `dealer ${dealerEmail}: recent_customer_searches extra field contained invalid JSON — resetting`
+                `dealer ${dealerEmail}: recent_customer_searches company extra field contained invalid JSON — resetting`
             );
         }
     }
@@ -407,8 +411,8 @@ async function upsertRecentCustomerSearches(
         RECENT_SEARCH_LIMIT
     );
 
-    if (b2bUser) {
-        await upsertB2BUserExtraField(b2bUser, 'recent_customer_searches', JSON.stringify(updated));
+    if (company) {
+        await upsertB2BCompanyExtraField(company, 'recent_customer_searches', JSON.stringify(updated));
     }
 
     return updated;

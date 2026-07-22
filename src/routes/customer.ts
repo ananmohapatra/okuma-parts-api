@@ -4,11 +4,14 @@ import bcClient from '../services/bigcommerce';
 import b2bClient from '../services/b2b';
 import fetchCustomerProfile, { BcCustomer } from '../services/customerProfile';
 import {
-    fetchB2BUserByEmail,
-    buildExtraFieldsMap,
-    upsertB2BUserExtraField,
-    upsertB2BUserExtraFields,
-} from '../services/b2b-user';
+    B2BCompanyRecord,
+    buildCompanyExtraFieldsMap,
+    fetchB2BCompanyById,
+    fetchB2BCompanyByUserEmail,
+    upsertB2BCompanyExtraField,
+    upsertB2BCompanyExtraFields,
+} from '../services/b2b-company';
+import { fetchB2BUserByEmail, buildExtraFieldsMap as buildUserExtraFieldsMap } from '../services/b2b-user';
 import logger from '../config/logger';
 import authenticateBCToken from '../middleware/auth';
 import config from '../config';
@@ -106,7 +109,19 @@ interface B2BMachinesResult {
     accountNumber: string | null;
     relationshipType: string | null;
     distributorId: string | null;
+    company: B2BCompanyRecord | null;
+    companyExtraFields: Record<string, string | undefined>;
 }
+
+const EMPTY_MACHINES_RESULT: B2BMachinesResult = {
+    machines: [],
+    companyId: null,
+    accountNumber: null,
+    relationshipType: null,
+    distributorId: null,
+    company: null,
+    companyExtraFields: {},
+};
 
 async function fetchB2BMachines(email: string): Promise<B2BMachinesResult> {
     try {
@@ -114,19 +129,26 @@ async function fetchB2BMachines(email: string): Promise<B2BMachinesResult> {
             params: { email },
         });
         const companyId = usersRes.data?.data?.[0]?.companyId ?? null;
-        if (!companyId)
-            return { machines: [], companyId: null, accountNumber: null, relationshipType: null, distributorId: null };
+        if (!companyId) return EMPTY_MACHINES_RESULT;
 
-        const companyRes = await b2bClient.get<{
-            data: { extraFields?: Array<{ fieldName: string; fieldValue: string }> };
-        }>(`/api/v3/io/companies/${companyId}`);
-        const extraFields = companyRes.data?.data?.extraFields ?? [];
+        const company = await fetchB2BCompanyById(companyId);
+        const extraFields = company?.extraFields ?? [];
+        const companyExtraFields = buildCompanyExtraFieldsMap(extraFields);
         const machinesField = extraFields.find(f => f.fieldName.toLowerCase() === 'machines');
         const accountNumber = extraFields.find(f => f.fieldName.toLowerCase() === 'account number')?.fieldValue ?? null;
         const relationshipType =
             extraFields.find(f => f.fieldName.toLowerCase() === 'relationship type')?.fieldValue ?? null;
         const distributorId = extraFields.find(f => f.fieldName.toLowerCase() === 'distributor id')?.fieldValue ?? null;
-        if (!machinesField) return { machines: [], companyId, accountNumber, relationshipType, distributorId };
+        if (!machinesField)
+            return {
+                machines: [],
+                companyId,
+                accountNumber,
+                relationshipType,
+                distributorId,
+                company,
+                companyExtraFields,
+            };
 
         let raw: B2BMachineRecord[];
         try {
@@ -135,7 +157,15 @@ async function fetchB2BMachines(email: string): Promise<B2BMachinesResult> {
             raw = Array.isArray(parsed) ? parsed : (parsed?.machines ?? []);
         } catch {
             logger.warn(`fetchB2BMachines: Machines field for company ${companyId} is not valid JSON`);
-            return { machines: [], companyId, accountNumber, relationshipType, distributorId };
+            return {
+                machines: [],
+                companyId,
+                accountNumber,
+                relationshipType,
+                distributorId,
+                company,
+                companyExtraFields,
+            };
         }
 
         logger.debug(
@@ -181,28 +211,14 @@ async function fetchB2BMachines(email: string): Promise<B2BMachinesResult> {
                 const cmp = a.model.localeCompare(b.model);
                 return cmp !== 0 ? cmp : a.serial.localeCompare(b.serial);
             });
-        return { machines, companyId, accountNumber, relationshipType, distributorId };
+        return { machines, companyId, accountNumber, relationshipType, distributorId, company, companyExtraFields };
     } catch (err) {
         logger.warn(`fetchB2BMachines: ${(err as Error).message}`);
-        return { machines: [], companyId: null, accountNumber: null, relationshipType: null, distributorId: null };
+        return EMPTY_MACHINES_RESULT;
     }
 }
 
 /** Find a B2B company whose Account Number extra field matches the given value. */
-async function fetchDistributorByAccountNumber(
-    accountNumber: string
-): Promise<{ companyId: number; companyName: string } | null> {
-    try {
-        const res = await b2bClient.get<{ data: Array<{ companyId: number; companyName: string }> }>(
-            '/api/v3/io/companies',
-            { params: { accountNumber, limit: 1 } }
-        );
-        return res.data?.data?.[0] ?? null;
-    } catch (err) {
-        logger.warn(`fetchDistributorByAccountNumber ${accountNumber}: ${(err as Error).message}`);
-        return null;
-    }
-}
 
 /**
  * Read per-customer machine context from Express session without mutating it.
@@ -352,16 +368,20 @@ router.get('/customer/:customerId/distributor', async (req: Request<{ customerId
             return res.json({ dealerId: null, dealerName: null });
         }
 
-        const { distributorId } = await fetchB2BMachines(profile.email);
-        if (!distributorId) {
+        const [b2bResult, b2bUser] = await Promise.all([
+            fetchB2BMachines(profile.email),
+            fetchB2BUserByEmail(profile.email),
+        ]);
+        const userExtraFields = buildUserExtraFieldsMap(b2bUser?.extraFields);
+        const dealerIdValue = userExtraFields.dealer_id ?? b2bResult.distributorId ?? null;
+
+        if (!dealerIdValue) {
             return res.json({ dealerId: null, dealerName: null });
         }
 
-        const distributor = await fetchDistributorByAccountNumber(distributorId);
-
         return res.json({
-            dealerId: distributorId,
-            dealerName: distributor?.companyName ?? null,
+            dealerId: dealerIdValue,
+            dealerName: b2bResult.company?.bcGroupName ?? null,
         });
     } catch (err) {
         logger.error(`customer ${customerId}: distributor lookup failed: ${(err as Error).message}`);
@@ -423,53 +443,43 @@ router.get('/customer/:customerId/header-context', async (req: Request<{ custome
     try {
         const profile = await fetchCustomerProfile(customerId);
 
-        // Fetch B2B user extra fields and B2B machines (company extra fields) in parallel
-        const [b2bUser, b2bResult] = await Promise.all([
+        const [b2bResult, b2bUser] = await Promise.all([
+            profile?.email ? fetchB2BMachines(profile.email) : Promise.resolve(EMPTY_MACHINES_RESULT),
             profile?.email ? fetchB2BUserByEmail(profile.email) : Promise.resolve(null),
-            profile?.email
-                ? fetchB2BMachines(profile.email)
-                : Promise.resolve({
-                      machines: [] as Machine[],
-                      companyId: null,
-                      accountNumber: null,
-                      relationshipType: null,
-                      distributorId: null,
-                  }),
         ]);
+        const { machines, companyId, accountNumber, relationshipType, distributorId, companyExtraFields } = b2bResult;
 
-        const extraFieldsMap = buildExtraFieldsMap(b2bUser?.extraFields);
-        const jobTitle = extraFieldsMap.job_title ?? null;
-        const { machines, companyId, accountNumber, relationshipType, distributorId } = b2bResult;
+        const userExtraFields = buildUserExtraFieldsMap(b2bUser?.extraFields);
+        const jobTitle = userExtraFields.job_title ?? null;
 
         // relationshipType from B2B company extra fields identifies account type
         const isDealer = relationshipType?.toLowerCase() === 'distributor';
 
         // Dealers ARE the distributor — their dealerId is their own accountNumber and
-        // dealerName is their own company. Non-dealers look up their parent distributor.
+        // dealerName is their own company. Non-dealers use their per-user dealer_id field,
+        // falling back to the company-level distributorId for backward compatibility.
         let dealerId: string | null;
         let dealerName: string | null;
         if (isDealer) {
             dealerId = accountNumber ?? null;
-            const ownCompany = accountNumber ? await fetchDistributorByAccountNumber(accountNumber) : null;
-            dealerName = ownCompany?.companyName ?? null;
+            dealerName = b2bResult.company?.companyName ?? null;
         } else {
-            const distributor = distributorId ? await fetchDistributorByAccountNumber(distributorId) : null;
-            dealerId = distributorId ?? null;
-            dealerName = distributor?.companyName ?? null;
+            dealerId = userExtraFields.dealer_id ?? distributorId ?? null;
+            dealerName = b2bResult.company?.bcGroupName ?? null;
         }
 
         // readSessionState never mutates req.session — avoids a store write on every GET
         const sessionState = readSessionState(req, customerId);
         const selectedMachine = resolveDefaultMachine(
             machines,
-            extraFieldsMap.last_viewed_machine,
+            companyExtraFields.last_viewed_machine,
             sessionState.selected
         );
 
-        const recentSerials = parseRecentSerials(extraFieldsMap.recent_machines, sessionState.recent ?? []);
+        const recentSerials = parseRecentSerials(companyExtraFields.recent_machines, sessionState.recent ?? []);
         const recentMachines = recentSerials
             .slice(0, RECENT_MACHINES_LIMIT)
-            .map(serial => machines.find(m => m.serial === serial))
+            .map(serial => machines.find((m: Machine) => m.serial === serial))
             .filter((m): m is Machine => m !== undefined);
 
         return res.json({
@@ -523,14 +533,12 @@ router.post('/customer/:customerId/machine/select', async (req: Request<{ custom
 
     try {
         const profile = await fetchCustomerProfile(customerId);
-        const [b2bUser, b2bMachinesResult] = await Promise.all([
-            profile?.email ? fetchB2BUserByEmail(profile.email) : Promise.resolve(null),
-            profile?.email ? fetchB2BMachines(profile.email) : Promise.resolve({ machines: [] as Machine[] }),
-        ]);
-        const { machines } = b2bMachinesResult;
-        const extraFieldsMap = buildExtraFieldsMap(b2bUser?.extraFields);
+        const b2bResult = profile?.email ? await fetchB2BMachines(profile.email) : EMPTY_MACHINES_RESULT;
+        const { machines, company, companyExtraFields } = b2bResult;
 
-        const machine = machines.find(m => m.serial === serial.trim() && (model ? m.model === model.trim() : true));
+        const machine = machines.find(
+            (m: Machine) => m.serial === serial.trim() && (model ? m.model === model.trim() : true)
+        );
 
         if (!machine) {
             return res.status(404).json({
@@ -538,9 +546,9 @@ router.post('/customer/:customerId/machine/select', async (req: Request<{ custom
             });
         }
 
-        // Seed recent list from B2B extra field so cross-session history is preserved
+        // Seed recent list from company extra field so cross-session history is preserved
         const sessionState = readSessionState(req, customerId);
-        const baseRecent = parseRecentSerials(extraFieldsMap.recent_machines, sessionState.recent ?? []);
+        const baseRecent = parseRecentSerials(companyExtraFields.recent_machines, sessionState.recent ?? []);
 
         const updatedRecent = [machine.serial, ...baseRecent.filter(s => s !== machine.serial)].slice(
             0,
@@ -550,18 +558,20 @@ router.post('/customer/:customerId/machine/select', async (req: Request<{ custom
         writeSessionState(req, customerId, { selected: machine.serial, recent: updatedRecent });
 
         const recentMachines = updatedRecent
-            .map(s => machines.find(m => m.serial === s))
+            .map(s => machines.find((m: Machine) => m.serial === s))
             .filter((m): m is Machine => m !== undefined);
 
         // Batch both extra field writes into a single B2B PUT call
-        if (b2bUser) {
+        if (company) {
             try {
-                await upsertB2BUserExtraFields(b2bUser, {
+                await upsertB2BCompanyExtraFields(company, {
                     last_viewed_machine: machine.serial,
                     recent_machines: JSON.stringify(updatedRecent),
                 });
             } catch (err) {
-                logger.error(`customer ${customerId}: B2B extra field upsert failed: ${(err as Error).message}`);
+                logger.error(
+                    `customer ${customerId}: B2B company extra field upsert failed: ${(err as Error).message}`
+                );
             }
         }
 
@@ -588,9 +598,9 @@ router.get('/customer/:customerId/searches', async (req: Request<{ customerId: s
 
     try {
         const profile = await fetchCustomerProfile(customerId);
-        const b2bUser = profile?.email ? await fetchB2BUserByEmail(profile.email) : null;
-        const extraFieldsMap = buildExtraFieldsMap(b2bUser?.extraFields);
-        const searches = parseRecentSearches(extraFieldsMap.recent_customer_searches);
+        const company = profile?.email ? await fetchB2BCompanyByUserEmail(profile.email) : null;
+        const companyExtraFields = buildCompanyExtraFieldsMap(company?.extraFields);
+        const searches = parseRecentSearches(companyExtraFields.recent_customer_searches);
         return res.json({ searches });
     } catch (err) {
         logger.error(`customer ${customerId}: searches fetch failed: ${(err as Error).message}`);
@@ -642,20 +652,20 @@ router.post('/customer/:customerId/searches', async (req: Request<{ customerId: 
 
     try {
         const profile = await fetchCustomerProfile(customerId);
-        const b2bUser = profile?.email ? await fetchB2BUserByEmail(profile.email) : null;
-        const extraFieldsMap = buildExtraFieldsMap(b2bUser?.extraFields);
-        const current = parseRecentSearches(extraFieldsMap.recent_customer_searches);
+        const company = profile?.email ? await fetchB2BCompanyByUserEmail(profile.email) : null;
+        const companyExtraFields = buildCompanyExtraFieldsMap(company?.extraFields);
+        const current = parseRecentSearches(companyExtraFields.recent_customer_searches);
         const updated = [entry, ...current.filter(s => s.customerId !== entry.customerId)].slice(
             0,
             RECENT_SEARCHES_LIMIT
         );
 
-        if (b2bUser) {
+        if (company) {
             try {
-                await upsertB2BUserExtraField(b2bUser, 'recent_customer_searches', JSON.stringify(updated));
+                await upsertB2BCompanyExtraField(company, 'recent_customer_searches', JSON.stringify(updated));
             } catch (err) {
                 logger.error(
-                    `customer ${customerId}: searches B2B extra field write failed: ${(err as Error).message}`
+                    `customer ${customerId}: searches B2B company extra field write failed: ${(err as Error).message}`
                 );
             }
         }
@@ -692,9 +702,9 @@ router.get('/customer/:customerId/metafields', async (req: Request<{ customerId:
 
     try {
         const profile = await fetchCustomerProfile(customerId);
-        const b2bUser = profile?.email ? await fetchB2BUserByEmail(profile.email) : null;
-        const extraFieldsMap = buildExtraFieldsMap(b2bUser?.extraFields);
-        const value = extraFieldsMap[key.trim()] ?? null;
+        const company = profile?.email ? await fetchB2BCompanyByUserEmail(profile.email) : null;
+        const companyExtraFields = buildCompanyExtraFieldsMap(company?.extraFields);
+        const value = companyExtraFields[key.trim()] ?? null;
 
         return res.json({
             customerId: parseInt(customerId, 10),

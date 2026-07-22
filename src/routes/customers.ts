@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import bcClient from '../services/bigcommerce';
 import fetchCustomerProfile from '../services/customerProfile';
-import { fetchB2BUserByEmail, buildExtraFieldsMap } from '../services/b2b-user';
+import { fetchB2BCompanyByUserEmail, buildCompanyExtraFieldsMap } from '../services/b2b-company';
 import logger from '../config/logger';
 
 const router = Router();
@@ -31,9 +31,9 @@ router.get('/api/customer/:customerId/profile', async (req, res) => {
             return res.status(404).json({ error: 'Customer not found.' });
         }
 
-        // Fetch job_title from B2B user extra fields (requires email from customer record)
-        const b2bUser = await fetchB2BUserByEmail(customer.email);
-        const extraFieldsMap = buildExtraFieldsMap(b2bUser?.extraFields);
+        // Fetch job_title from B2B company extra fields
+        const company = await fetchB2BCompanyByUserEmail(customer.email);
+        const companyExtraFields = buildCompanyExtraFieldsMap(company?.extraFields);
 
         return res.json({
             firstName: customer.first_name,
@@ -41,7 +41,7 @@ router.get('/api/customer/:customerId/profile', async (req, res) => {
             email: customer.email,
             phone: customer.phone || null,
             company: customer.company || null,
-            jobTitle: extraFieldsMap.job_title ?? null,
+            jobTitle: companyExtraFields.job_title ?? null,
         });
     } catch (err) {
         logger.error(`customer ${customerId}: profile fetch failed: ${(err as Error).message}`);

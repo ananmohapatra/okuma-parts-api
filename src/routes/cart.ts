@@ -230,63 +230,137 @@ router.post('/cart/items', async (req: Request, res: Response) => {
             },
         });
     } catch (err) {
-        logger.error(`cart add item failed (productId=${productId}): ${(err as Error).message}`);
+        const axErr = err as import('axios').AxiosError;
+        const detail = axErr.response
+            ? `BC ${axErr.response.status}: ${JSON.stringify(axErr.response.data)}`
+            : (err as Error).message;
+        logger.error(`cart add item failed (productId=${productId}): ${detail}`);
         return res.status(500).json({ error: 'Could not add item to cart.' });
     }
 });
 
+interface ShapedCart {
+    cartId: string;
+    baseAmount: number;
+    cartAmount: number;
+    lineItemCount: number;
+    lineItems: {
+        id: string;
+        productId: number;
+        variantId: number;
+        name: string;
+        sku: string;
+        quantity: number;
+        salePrice: number;
+        listPrice: number;
+        imageUrl: string | null;
+    }[];
+    redirectUrls: {
+        cartUrl: string;
+        checkoutUrl: string;
+        embeddedCheckoutUrl: string;
+    };
+}
+
 /**
- * GET /cart
- *
- * Returns the current cart from session. 404 when no active cart exists.
- *
- * Response: { cartId, baseAmount, cartAmount, lineItemCount, lineItems[], redirectUrls }
+ * Fetch a cart from BC and return it as a plain shaped object.
+ * Throws AxiosError on BC failure so callers can distinguish 404 from 5xx.
  */
-router.get('/cart', async (req: Request, res: Response) => {
-    const cartId = getCartId(req);
+async function shapeCart(cartId: string): Promise<ShapedCart> {
+    const cartRes = await bcClient.get<{ data: BcCart }>(`/v3/carts/${cartId}`, {
+        params: { include: 'line_items.physical_items.options' },
+    });
+    const cart = cartRes.data.data;
+    const redirectUrls = await fetchRedirectUrls(cartId);
+    const physicalItems = cart.line_items?.physical_items ?? [];
 
-    if (!cartId) {
-        return res.status(404).json({ error: 'No active cart.' });
-    }
+    return {
+        cartId: cart.id,
+        baseAmount: cart.base_amount,
+        cartAmount: cart.cart_amount,
+        lineItemCount: physicalItems.length,
+        lineItems: physicalItems.map(item => ({
+            id: item.id,
+            productId: item.product_id,
+            variantId: item.variant_id,
+            name: item.name,
+            sku: item.sku,
+            quantity: item.quantity,
+            salePrice: item.sale_price,
+            listPrice: item.list_price,
+            imageUrl: item.image_url ?? null,
+        })),
+        redirectUrls: {
+            cartUrl: redirectUrls.cart_url,
+            checkoutUrl: redirectUrls.checkout_url,
+            embeddedCheckoutUrl: redirectUrls.embedded_checkout_url,
+        },
+    };
+}
 
+/**
+ * Shared cart fetch logic for explicit-ID routes.
+ * Used by GET /cart/:cartId.
+ */
+async function fetchAndShapeCart(cartId: string, res: Response, onNotFound: () => void): Promise<Response> {
     try {
-        const cartRes = await bcClient.get<{ data: BcCart }>(`/v3/carts/${cartId}`, {
-            params: { include: 'line_items.physical_items.options' },
-        });
-        const cart = cartRes.data.data;
-        const redirectUrls = await fetchRedirectUrls(cartId);
-        const physicalItems = cart.line_items?.physical_items ?? [];
-
-        return res.json({
-            cartId: cart.id,
-            baseAmount: cart.base_amount,
-            cartAmount: cart.cart_amount,
-            lineItemCount: physicalItems.length,
-            lineItems: physicalItems.map(item => ({
-                id: item.id,
-                productId: item.product_id,
-                variantId: item.variant_id,
-                name: item.name,
-                sku: item.sku,
-                quantity: item.quantity,
-                salePrice: item.sale_price,
-                listPrice: item.list_price,
-                imageUrl: item.image_url ?? null,
-            })),
-            redirectUrls: {
-                cartUrl: redirectUrls.cart_url,
-                checkoutUrl: redirectUrls.checkout_url,
-                embeddedCheckoutUrl: redirectUrls.embedded_checkout_url,
-            },
-        });
+        const shaped = await shapeCart(cartId);
+        return res.json(shaped);
     } catch (err) {
         if ((err as AxiosError).response?.status === 404) {
-            clearCartId(req);
+            onNotFound();
             return res.status(404).json({ error: 'Cart has expired or does not exist.' });
         }
         logger.error(`cart fetch failed (cartId=${cartId}): ${(err as Error).message}`);
         return res.status(500).json({ error: 'Could not load cart.' });
     }
+}
+
+/**
+ * GET /cart
+ *
+ * Returns all available carts for the current session as an array.
+ * An empty array is returned when no active cart exists (never 404).
+ * At most one cart is returned — BC has no multi-cart session support via the
+ * management API, but the array envelope keeps the response shape extensible.
+ *
+ * Response: { carts: ShapedCart[] }
+ */
+router.get('/cart', async (req: Request, res: Response) => {
+    const cartId = getCartId(req);
+
+    if (!cartId) {
+        return res.json({ carts: [] });
+    }
+
+    try {
+        const shaped = await shapeCart(cartId);
+        return res.json({ carts: [shaped] });
+    } catch (err) {
+        if ((err as AxiosError).response?.status === 404) {
+            clearCartId(req);
+            return res.json({ carts: [] });
+        }
+        logger.error(`cart fetch failed (cartId=${cartId}): ${(err as Error).message}`);
+        return res.status(500).json({ error: 'Could not load cart.' });
+    }
+});
+
+/**
+ * GET /cart/:cartId
+ *
+ * Fetch a cart by explicit ID. Does not require a session — useful for
+ * server-to-server calls or when the Stencil theme passes the cartId directly.
+ * Returns 404 when the cart does not exist or has expired on BC.
+ */
+router.get('/cart/:cartId', async (req: Request<{ cartId: string }>, res: Response) => {
+    const { cartId } = req.params;
+
+    if (!cartId || !/^[0-9a-f-]{36}$/.test(cartId)) {
+        return res.status(400).json({ error: 'Invalid cartId.' });
+    }
+
+    return fetchAndShapeCart(cartId, res, () => {});
 });
 
 /**
@@ -323,7 +397,7 @@ router.delete('/cart/items/:itemId', async (req: Request, res: Response) => {
 /**
  * DELETE /cart
  *
- * Delete the entire cart and clear the session.
+ * Delete the cart bound to the current session and clear the session.
  *
  * Response: 204 No Content on success.
  */
@@ -345,6 +419,37 @@ router.delete('/cart', async (req: Request, res: Response) => {
     }
 
     clearCartId(req);
+    return res.status(204).send();
+});
+
+/**
+ * DELETE /cart/:cartId
+ *
+ * Delete a cart by explicit ID. Does not require a session.
+ * If the cartId matches the session cart, the session is also cleared.
+ *
+ * Response: 204 No Content on success or when the cart is already gone.
+ */
+router.delete('/cart/:cartId', async (req: Request<{ cartId: string }>, res: Response) => {
+    const { cartId } = req.params;
+
+    if (!cartId || !/^[0-9a-f-]{36}$/.test(cartId)) {
+        return res.status(400).json({ error: 'Invalid cartId.' });
+    }
+
+    try {
+        await bcClient.delete(`/v3/carts/${cartId}`);
+    } catch (err) {
+        if ((err as AxiosError).response?.status !== 404) {
+            logger.error(`cart delete by id failed (cartId=${cartId}): ${(err as Error).message}`);
+            return res.status(500).json({ error: 'Could not delete cart.' });
+        }
+    }
+
+    if (getCartId(req) === cartId) {
+        clearCartId(req);
+    }
+
     return res.status(204).send();
 });
 
