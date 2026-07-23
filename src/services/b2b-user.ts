@@ -53,15 +53,51 @@ export async function fetchB2BUserByEmail(email: string): Promise<B2BUserRecord 
     }
 }
 
+/** Normalize a B2B extra field name to the snake_case key used for lookups. */
+function normalizeFieldName(name: string): string {
+    return name.toLowerCase().replace(/\s+/g, '_');
+}
+
 /**
- * Build a key→value map from a B2B user's extra fields array for easy lookup.
+ * Build a key→value map from a B2B extra fields array for easy lookup.
+ * Keys are normalized to snake_case so lookups like `map.last_viewed_machine`
+ * work regardless of how the field was named in B2B admin (e.g. "Last Viewed Machine").
  */
 export function buildExtraFieldsMap(extraFields?: B2BUserExtraField[]): Record<string, string | undefined> {
     const map: Record<string, string | undefined> = Object.create(null);
     (extraFields ?? []).forEach(f => {
-        map[f.fieldName] = f.fieldValue;
+        map[normalizeFieldName(f.fieldName)] = f.fieldValue;
     });
     return map;
+}
+
+export { normalizeFieldName };
+
+/**
+ * Merge updates into an existing extra fields array.
+ * Matching is case-insensitive / space-tolerant (normalized to snake_case).
+ * The original fieldName from B2B is preserved so the API accepts the payload.
+ * New keys (not found in existing) are appended using the provided key string.
+ */
+function mergeExtraFields(existing: B2BUserExtraField[], updates: Record<string, string>): B2BUserExtraField[] {
+    const normalizedUpdates = new Map(Object.entries(updates).map(([k, v]) => [normalizeFieldName(k), v]));
+
+    // Update matching fields in-place (preserve original fieldName)
+    const merged = existing.map(f => {
+        const v = normalizedUpdates.get(normalizeFieldName(f.fieldName));
+        return v !== undefined ? { fieldName: f.fieldName, fieldValue: v } : f;
+    });
+
+    // Append fields that had no match in existing
+    const existingNormalized = new Set(existing.map(f => normalizeFieldName(f.fieldName)));
+    normalizedUpdates.forEach((value, normalized) => {
+        if (!existingNormalized.has(normalized)) {
+            const originalKey = Object.keys(updates).find(k => normalizeFieldName(k) === normalized)!;
+            merged.push({ fieldName: originalKey, fieldValue: value });
+        }
+    });
+
+    return merged;
 }
 
 /**
@@ -70,7 +106,6 @@ export function buildExtraFieldsMap(extraFields?: B2BUserExtraField[]): Record<s
  * Uses PUT (full user replacement) as required by the B2B Edition API.
  */
 export async function upsertB2BUserExtraField(user: B2BUserRecord, key: string, value: string): Promise<void> {
-    const other = (user.extraFields ?? []).filter(f => f.fieldName !== key);
     try {
         await b2bClient.put(`/api/v3/io/users/${user.id}`, {
             customerId: user.customerId,
@@ -80,7 +115,7 @@ export async function upsertB2BUserExtraField(user: B2BUserRecord, key: string, 
             phoneNumber: user.phoneNumber,
             role: user.role,
             companyId: user.companyId,
-            extraFields: [...other, { fieldName: key, fieldValue: value }],
+            extraFields: mergeExtraFields(user.extraFields ?? [], { [key]: value }),
         });
     } catch (err) {
         if (axios.isAxiosError(err)) {
@@ -95,12 +130,6 @@ export async function upsertB2BUserExtraField(user: B2BUserRecord, key: string, 
  * All existing extra fields not in the `updates` map are preserved.
  */
 export async function upsertB2BUserExtraFields(user: B2BUserRecord, updates: Record<string, string>): Promise<void> {
-    const keysToUpdate = new Set(Object.keys(updates));
-    const other = (user.extraFields ?? []).filter(f => !keysToUpdate.has(f.fieldName));
-    const newFields: B2BUserExtraField[] = Object.entries(updates).map(([k, v]) => ({
-        fieldName: k,
-        fieldValue: v,
-    }));
     try {
         await b2bClient.put(`/api/v3/io/users/${user.id}`, {
             customerId: user.customerId,
@@ -110,7 +139,7 @@ export async function upsertB2BUserExtraFields(user: B2BUserRecord, updates: Rec
             phoneNumber: user.phoneNumber,
             role: user.role,
             companyId: user.companyId,
-            extraFields: [...other, ...newFields],
+            extraFields: mergeExtraFields(user.extraFields ?? [], updates),
         });
     } catch (err) {
         if (axios.isAxiosError(err)) {

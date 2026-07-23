@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { AxiosError } from 'axios';
 import bcClient from '../services/bigcommerce';
 import logger from '../config/logger';
+import config from '../config';
 
 const router = Router();
 
@@ -93,7 +94,10 @@ async function createCart(
     const lineItem: Record<string, unknown> = { product_id: productId, quantity };
     if (variantId) lineItem.variant_id = variantId;
 
-    const payload: Record<string, unknown> = { line_items: [lineItem] };
+    const payload: Record<string, unknown> = {
+        channel_id: config.bc.channelId,
+        line_items: [lineItem],
+    };
     if (customerId) payload.customer_id = customerId;
 
     const res = await bcClient.post<{ data: BcCart }>('/v3/carts', payload);
@@ -208,6 +212,7 @@ router.post('/cart/items', async (req: Request, res: Response) => {
             cartId: cart.id,
             cart: {
                 id: cart.id,
+                customerId: cart.customer_id,
                 baseAmount: cart.base_amount,
                 cartAmount: cart.cart_amount,
                 lineItemCount: physicalItems.length,
@@ -241,6 +246,7 @@ router.post('/cart/items', async (req: Request, res: Response) => {
 
 interface ShapedCart {
     cartId: string;
+    customerId: number;
     baseAmount: number;
     cartAmount: number;
     lineItemCount: number;
@@ -276,6 +282,7 @@ async function shapeCart(cartId: string): Promise<ShapedCart> {
 
     return {
         cartId: cart.id,
+        customerId: cart.customer_id,
         baseAmount: cart.base_amount,
         cartAmount: cart.cart_amount,
         lineItemCount: physicalItems.length,
@@ -451,6 +458,85 @@ router.delete('/cart/:cartId', async (req: Request<{ cartId: string }>, res: Res
     }
 
     return res.status(204).send();
+});
+
+/**
+ * PUT /cart/:cartId
+ *
+ * Update the customer_id bound to an existing cart.
+ * BC docs: changing customer_id removes any promotions or shipping calculations
+ * tied to the previous customer's group.
+ * Pass customerId=0 to convert a customer cart back to a guest cart.
+ *
+ * BC OOTB: PUT /v3/carts/:cartId  { customer_id }
+ *
+ * Body:     { "customerId": number }  — 0 = guest, positive integer = customer
+ * Response: shaped cart (same shape as GET /cart/:cartId)
+ */
+router.put('/cart/:cartId', async (req: Request<{ cartId: string }>, res: Response) => {
+    const { cartId } = req.params;
+    const { customerId } = req.body as { customerId?: unknown };
+
+    if (!cartId || !/^[0-9a-f-]{36}$/.test(cartId)) {
+        return res.status(400).json({ error: 'Invalid cartId.' });
+    }
+    if (
+        customerId === undefined ||
+        customerId === null ||
+        typeof customerId !== 'number' ||
+        !Number.isInteger(customerId) ||
+        customerId < 0
+    ) {
+        return res.status(400).json({ error: 'customerId must be a non-negative integer (0 = guest cart).' });
+    }
+
+    const session = req.session as unknown as { customerId?: string };
+    if (customerId > 0 && session.customerId && session.customerId !== String(customerId)) {
+        return res.status(403).json({ error: 'Forbidden.' });
+    }
+
+    try {
+        const cartRes = await bcClient.put<{ data: BcCart }>(`/v3/carts/${cartId}`, {
+            customer_id: customerId,
+        });
+        const cart = cartRes.data.data;
+        const redirectUrls = await fetchRedirectUrls(cartId);
+        const physicalItems = cart.line_items?.physical_items ?? [];
+
+        return res.json({
+            cartId: cart.id,
+            customerId: cart.customer_id,
+            baseAmount: cart.base_amount,
+            cartAmount: cart.cart_amount,
+            lineItemCount: physicalItems.length,
+            lineItems: physicalItems.map(item => ({
+                id: item.id,
+                productId: item.product_id,
+                variantId: item.variant_id,
+                name: item.name,
+                sku: item.sku,
+                quantity: item.quantity,
+                salePrice: item.sale_price,
+                listPrice: item.list_price,
+                imageUrl: item.image_url ?? null,
+            })),
+            redirectUrls: {
+                cartUrl: redirectUrls.cart_url,
+                checkoutUrl: redirectUrls.checkout_url,
+                embeddedCheckoutUrl: redirectUrls.embedded_checkout_url,
+            },
+        });
+    } catch (err) {
+        const status = (err as AxiosError).response?.status;
+        if (status === 404) {
+            return res.status(404).json({ error: 'Cart not found.' });
+        }
+        if (status === 422) {
+            return res.status(422).json({ error: 'Customer not found or cannot be assigned to this cart.' });
+        }
+        logger.error(`cart update customerId failed (cartId=${cartId}): ${(err as Error).message}`);
+        return res.status(500).json({ error: 'Could not update cart.' });
+    }
 });
 
 export { router as cartRouter };

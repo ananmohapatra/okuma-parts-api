@@ -1,6 +1,6 @@
 import axios from 'axios';
 import b2bClient from './b2b';
-import { B2BUserExtraField, buildExtraFieldsMap } from './b2b-user';
+import { B2BUserExtraField, buildExtraFieldsMap, normalizeFieldName } from './b2b-user';
 import logger from '../config/logger';
 
 // ---------------------------------------------------------------------------
@@ -8,7 +8,7 @@ import logger from '../config/logger';
 // ---------------------------------------------------------------------------
 
 export interface B2BCompanyRecord {
-    id: number;
+    companyId: number;
     companyName: string;
     companyEmail?: string;
     phoneNumber?: string;
@@ -56,22 +56,44 @@ export async function fetchB2BCompanyByUserEmail(email: string): Promise<B2BComp
 }
 
 /**
+ * Merge updates into a company extra fields array, preserving original field names.
+ * Matching is case-insensitive / space-tolerant (normalized to snake_case).
+ */
+function mergeCompanyExtraFields(existing: B2BUserExtraField[], updates: Record<string, string>): B2BUserExtraField[] {
+    const normalizedUpdates = new Map(Object.entries(updates).map(([k, v]) => [normalizeFieldName(k), v]));
+
+    const merged = existing.map(f => {
+        const v = normalizedUpdates.get(normalizeFieldName(f.fieldName));
+        return v !== undefined ? { fieldName: f.fieldName, fieldValue: v } : f;
+    });
+
+    const existingNormalized = new Set(existing.map(f => normalizeFieldName(f.fieldName)));
+    normalizedUpdates.forEach((value, normalized) => {
+        if (!existingNormalized.has(normalized)) {
+            const originalKey = Object.keys(updates).find(k => normalizeFieldName(k) === normalized)!;
+            merged.push({ fieldName: originalKey, fieldValue: value });
+        }
+    });
+
+    return merged;
+}
+
+/**
  * Upsert a single extra field on a B2B company.
  * All existing extra fields are preserved; the target key is added or overwritten.
  */
 export async function upsertB2BCompanyExtraField(company: B2BCompanyRecord, key: string, value: string): Promise<void> {
-    const other = (company.extraFields ?? []).filter(f => f.fieldName !== key);
     try {
-        await b2bClient.put(`/api/v3/io/companies/${company.id}`, {
+        await b2bClient.put(`/api/v3/io/companies/${company.companyId}`, {
             companyName: company.companyName,
             companyEmail: company.companyEmail,
             phoneNumber: company.phoneNumber,
             bcGroupName: company.bcGroupName,
-            extraFields: [...other, { fieldName: key, fieldValue: value }],
+            extraFields: mergeCompanyExtraFields(company.extraFields ?? [], { [key]: value }),
         });
     } catch (err) {
         if (axios.isAxiosError(err)) {
-            logger.error(`b2b-company: PUT /companies/${company.id} failed: status=${err.response?.status}`);
+            logger.error(`b2b-company: PUT /companies/${company.companyId} failed: status=${err.response?.status}`);
         }
         throw err;
     }
@@ -85,24 +107,18 @@ export async function upsertB2BCompanyExtraFields(
     company: B2BCompanyRecord,
     updates: Record<string, string>
 ): Promise<void> {
-    const keysToUpdate = new Set(Object.keys(updates));
-    const other = (company.extraFields ?? []).filter(f => !keysToUpdate.has(f.fieldName));
-    const newFields: B2BUserExtraField[] = Object.entries(updates).map(([k, v]) => ({
-        fieldName: k,
-        fieldValue: v,
-    }));
     try {
-        await b2bClient.put(`/api/v3/io/companies/${company.id}`, {
+        await b2bClient.put(`/api/v3/io/companies/${company.companyId}`, {
             companyName: company.companyName,
             companyEmail: company.companyEmail,
             phoneNumber: company.phoneNumber,
             bcGroupName: company.bcGroupName,
-            extraFields: [...other, ...newFields],
+            extraFields: mergeCompanyExtraFields(company.extraFields ?? [], updates),
         });
     } catch (err) {
         if (axios.isAxiosError(err)) {
             logger.error(
-                `b2b-company: PUT /companies/${company.id} failed: status=${err.response?.status} body=${JSON.stringify(err.response?.data)}`
+                `b2b-company: PUT /companies/${company.companyId} failed: status=${err.response?.status} body=${JSON.stringify(err.response?.data)}`
             );
         }
         throw err;

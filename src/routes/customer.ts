@@ -133,13 +133,16 @@ async function fetchB2BMachines(email: string): Promise<B2BMachinesResult> {
 
         const company = await fetchB2BCompanyById(companyId);
         const extraFields = company?.extraFields ?? [];
+        logger.debug(`fetchB2BMachines company ${companyId}: extraFields count=${extraFields.length}`);
         const companyExtraFields = buildCompanyExtraFieldsMap(extraFields);
-        const machinesField = extraFields.find(f => f.fieldName.toLowerCase() === 'machines');
-        const accountNumber = extraFields.find(f => f.fieldName.toLowerCase() === 'account number')?.fieldValue ?? null;
-        const relationshipType =
-            extraFields.find(f => f.fieldName.toLowerCase() === 'relationship type')?.fieldValue ?? null;
-        const distributorId = extraFields.find(f => f.fieldName.toLowerCase() === 'distributor id')?.fieldValue ?? null;
-        if (!machinesField)
+        const machinesJson = companyExtraFields.machines;
+        const accountNumber = companyExtraFields.account_number || null;
+        const relationshipType = companyExtraFields.relationship_type || null;
+        const distributorId = companyExtraFields.distributor_id || null;
+        logger.info(
+            `fetchB2BMachines company ${companyId}: accountNumber=${accountNumber} relationshipType=${relationshipType} distributorId=${distributorId}`
+        );
+        if (!machinesJson)
             return {
                 machines: [],
                 companyId,
@@ -152,7 +155,7 @@ async function fetchB2BMachines(email: string): Promise<B2BMachinesResult> {
 
         let raw: B2BMachineRecord[];
         try {
-            const sanitized = machinesField.fieldValue.replace(/,(\s*[}\]])/g, '$1');
+            const sanitized = machinesJson.replace(/,(\s*[}\]])/g, '$1');
             const parsed = JSON.parse(sanitized);
             raw = Array.isArray(parsed) ? parsed : (parsed?.machines ?? []);
         } catch {
@@ -461,11 +464,11 @@ router.get('/customer/:customerId/header-context', async (req: Request<{ custome
         let dealerId: string | null;
         let dealerName: string | null;
         if (isDealer) {
-            dealerId = accountNumber ?? null;
-            dealerName = b2bResult.company?.companyName ?? null;
+            dealerId = accountNumber || null;
+            dealerName = b2bResult.company?.companyName || null;
         } else {
-            dealerId = userExtraFields.dealer_id ?? distributorId ?? null;
-            dealerName = b2bResult.company?.bcGroupName ?? null;
+            dealerId = userExtraFields.dealer_id || distributorId || null;
+            dealerName = b2bResult.company?.bcGroupName || null;
         }
 
         // readSessionState never mutates req.session — avoids a store write on every GET
