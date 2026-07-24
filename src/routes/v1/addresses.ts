@@ -234,8 +234,10 @@ async function fetchAllAddressesForCompany(companyId: number): Promise<B2BAddres
     return mapInBatches(all, address => fetchAddressById(String(address.addressId)).then(full => full ?? address));
 }
 
+// GET /v1/api/addresses?companyId=13802422&approvalStatus=pending&limit=20&page=1
 // GET /v1/api/addresses?distributorId=326&companyId=13802422&approvalStatus=pending&limit=20&page=1
-// distributorId is required. companyId is optional — omit to get addresses across all associated customers.
+// distributorId is optional. When provided, scopes results to the distributor's customers.
+// When omitted, companyId is required and addresses are returned directly for that company.
 router.get('/addresses', async (req: Request, res: Response) => {
     try {
         const distributorIdRaw = req.query.distributorId as string | undefined;
@@ -243,8 +245,8 @@ router.get('/addresses', async (req: Request, res: Response) => {
         const limitRaw = Number(req.query.limit);
         const pageRaw = Number(req.query.page);
 
-        if (!distributorIdRaw || !/^\d+$/.test(distributorIdRaw)) {
-            return res.status(400).json({ error: 'distributorId is required and must be a positive integer' });
+        if (distributorIdRaw !== undefined && !/^\d+$/.test(distributorIdRaw)) {
+            return res.status(400).json({ error: 'distributorId must be a positive integer' });
         }
         if (companyIdRaw !== undefined && !/^\d+$/.test(companyIdRaw)) {
             return res.status(400).json({ error: 'companyId must be a positive integer' });
@@ -261,26 +263,35 @@ router.get('/addresses', async (req: Request, res: Response) => {
         const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 250) : 50;
         const page = Number.isInteger(pageRaw) && pageRaw > 0 ? pageRaw : 1;
 
-        // Resolve distributor
-        const accountNumber = await resolveDistributorAccountNumber(distributorIdRaw);
-        if (!accountNumber) {
-            return res.status(403).json({ error: 'Forbidden: only distributors may view address requests' });
-        }
-
         let companyIds: number[];
-        if (companyIdRaw) {
-            // Validate the requested company belongs to this distributor
-            const company = await fetchB2BCompanyById(Number(companyIdRaw));
-            if (!company) {
-                return res.status(502).json({ error: 'Unable to resolve requested company from B2B API' });
+
+        if (distributorIdRaw) {
+            // Distributor flow: validate distributor and scope to their customers
+            const accountNumber = await resolveDistributorAccountNumber(distributorIdRaw);
+            if (!accountNumber) {
+                return res.status(403).json({ error: 'Forbidden: only distributors may view address requests' });
             }
-            const companyFields = buildExtraFieldsMap(company.extraFields);
-            if (companyFields.distributor_id !== accountNumber) {
-                return res.status(403).json({ error: 'Forbidden: this company does not belong to your customers' });
+
+            if (companyIdRaw) {
+                // Validate the requested company belongs to this distributor
+                const company = await fetchB2BCompanyById(Number(companyIdRaw));
+                if (!company) {
+                    return res.status(502).json({ error: 'Unable to resolve requested company from B2B API' });
+                }
+                const companyFields = buildExtraFieldsMap(company.extraFields);
+                if (companyFields.distributor_id !== accountNumber) {
+                    return res.status(403).json({ error: 'Forbidden: this company does not belong to your customers' });
+                }
+                companyIds = [Number(companyIdRaw)];
+            } else {
+                companyIds = await fetchDistributorCustomerCompanyIds(accountNumber);
+            }
+        } else {
+            // Customer flow: companyId is required when distributorId is not provided
+            if (!companyIdRaw) {
+                return res.status(400).json({ error: 'companyId is required when distributorId is not provided' });
             }
             companyIds = [Number(companyIdRaw)];
-        } else {
-            companyIds = await fetchDistributorCustomerCompanyIds(accountNumber);
         }
 
         if (companyIds.length === 0) {
@@ -345,7 +356,9 @@ router.post('/addresses', async (req: Request, res: Response) => {
                 }
                 const fields = buildExtraFieldsMap(company.extraFields);
                 if (fields.distributor_id !== accountNumber) {
-                    return res.status(403).json({ error: 'Forbidden: distributorId is not associated with this company' });
+                    return res
+                        .status(403)
+                        .json({ error: 'Forbidden: distributorId is not associated with this company' });
                 }
                 initialStatus = 'approved';
             }
