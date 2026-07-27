@@ -1,4 +1,3 @@
-
 import { Router, Request, Response } from 'express';
 import axios, { AxiosError } from 'axios';
 import logger from '../config/logger';
@@ -8,15 +7,11 @@ import bcClient from '../services/bigcommerce';
 const router = Router();
 
 function bluesnapBase(): string {
-    return config.bluesnap.env === 'production'
-        ? 'https://ws.bluesnap.com'
-        : 'https://sandbox.bluesnap.com';
+    return config.bluesnap.env === 'production' ? 'https://ws.bluesnap.com' : 'https://sandbox.bluesnap.com';
 }
 
 function bluesnapAuthHeader(): string {
-    const credentials = Buffer.from(
-        `${config.bluesnap.apiUsername}:${config.bluesnap.apiPassword}`
-    ).toString('base64');
+    const credentials = Buffer.from(`${config.bluesnap.apiUsername}:${config.bluesnap.apiPassword}`).toString('base64');
     return `Basic ${credentials}`;
 }
 
@@ -33,7 +28,7 @@ interface BluesnapErrorBody {
 
 function bluesnapErrorMessage(err: unknown): string {
     const axErr = err as AxiosError<BluesnapErrorBody>;
-    const data  = axErr.response?.data;
+    const data = axErr.response?.data;
     if (Array.isArray(data?.message) && data.message.length > 0) {
         const entry = data.message[0];
         return `${entry.errorName ?? 'UNKNOWN'} (code ${entry.code ?? '?'}): ${entry.description ?? ''}`.trim();
@@ -47,7 +42,6 @@ function bluesnapDebugDetail(err: unknown): object {
     const axErr = err as AxiosError<BluesnapErrorBody>;
     return {
         bsStatus: axErr.response?.status,
-        bsBody:   axErr.response?.data ?? null,
     };
 }
 
@@ -66,26 +60,23 @@ router.get('/bluesnap/hpf-token', async (_req: Request, res: Response) => {
         logger.warn('bluesnap hpf-token: BLUESNAP_API_USERNAME or BLUESNAP_API_PASSWORD not set');
         return res.status(503).json({ error: 'Payment service not configured' });
     }
-    logger.debug(`bluesnap hpf-token: using user=${apiUsername.slice(0, 8)}…`);
+    logger.debug('bluesnap hpf-token: request received');
 
     try {
-        const response = await axios.post(
-            `${bluesnapBase()}/services/2/payment-fields-tokens`,
-            null,
-            {
-                headers: {
-                    Authorization:  bluesnapAuthHeader(),
-                    'Content-Type': 'application/json',
-                },
-                validateStatus: status => status >= 200 && status < 300,
-            }
-        );
+        const response = await axios.post(`${bluesnapBase()}/services/2/payment-fields-tokens`, null, {
+            headers: {
+                Authorization: bluesnapAuthHeader(),
+                'Content-Type': 'application/json',
+            },
+            timeout: 10000,
+            validateStatus: status => status >= 200 && status < 300,
+        });
 
-        const location = (response.headers['location'] as string) ?? '';
-        const pfToken  = location.split('/').pop() ?? '';
+        const locationHeader = (response.headers.location as string) ?? '';
+        const pfToken = locationHeader.split('/').pop() ?? '';
 
         if (!pfToken) {
-            logger.error('bluesnap hpf-token: Location header missing or empty', { location });
+            logger.error('bluesnap hpf-token: Location header missing or empty', { locationHeader });
             return res.status(502).json({ error: 'BlueSnap did not return a pfToken' });
         }
 
@@ -94,7 +85,7 @@ router.get('/bluesnap/hpf-token', async (_req: Request, res: Response) => {
     } catch (err) {
         const axErr = err as AxiosError;
         const bsStatus = axErr.response?.status;
-        const bsBody   = axErr.response?.data;
+        const bsBody = axErr.response?.data;
         logger.error(`bluesnap hpf-token failed (BS HTTP ${bsStatus}): ${JSON.stringify(bsBody)}`);
         return res.status(502).json({ error: 'Failed to create payment fields token' });
     }
@@ -117,8 +108,13 @@ interface ChargeBody {
  * Response: { success: true }
  */
 router.post('/bluesnap/charge', async (req: Request, res: Response) => {
-    const { pfToken, amount, currency, cardHolderName } = req.body as ChargeBody;
+    const { apiUsername, apiPassword } = config.bluesnap;
+    if (!apiUsername || !apiPassword) {
+        logger.warn('bluesnap charge: BLUESNAP_API_USERNAME or BLUESNAP_API_PASSWORD not set');
+        return res.status(503).json({ error: 'Payment service not configured' });
+    }
 
+    const { pfToken, amount, currency, cardHolderName } = req.body as ChargeBody;
     if (typeof pfToken !== 'string' || !pfToken.trim()) {
         return res.status(400).json({ error: 'pfToken is required' });
     }
@@ -131,7 +127,7 @@ router.post('/bluesnap/charge', async (req: Request, res: Response) => {
 
     const holderParts = typeof cardHolderName === 'string' ? cardHolderName.trim().split(' ') : [];
     const holderFirst = holderParts[0] ?? '';
-    const holderLast  = holderParts.slice(1).join(' ') ?? '';
+    const holderLast = holderParts.slice(1).join(' ') ?? '';
 
     try {
         await axios.post(
@@ -140,21 +136,23 @@ router.post('/bluesnap/charge', async (req: Request, res: Response) => {
                 amount,
                 currency,
                 paymentSources: {
-                    creditCardInfo: [{
-                        pfToken: pfToken.trim(),
-                    }],
+                    creditCardInfo: [
+                        {
+                            pfToken: pfToken.trim(),
+                        },
+                    ],
                 },
                 cardHolderInfo: {
                     firstName: holderFirst,
-                    lastName:  holderLast,
+                    lastName: holderLast,
                 },
                 transactionType: 'AUTH_CAPTURE',
             },
             {
                 headers: {
-                    Authorization:  bluesnapAuthHeader(),
+                    Authorization: bluesnapAuthHeader(),
                     'Content-Type': 'application/json',
-                    Accept:         'application/json',
+                    Accept: 'application/json',
                 },
             }
         );
@@ -162,18 +160,27 @@ router.post('/bluesnap/charge', async (req: Request, res: Response) => {
         logger.info(`bluesnap charge: success (amount=${amount} ${currency})`);
         return res.json({ success: true });
     } catch (err) {
-        const msg    = bluesnapErrorMessage(err);
+        const msg = bluesnapErrorMessage(err);
         const detail = bluesnapDebugDetail(err);
         const status = (err as AxiosError).response?.status ?? 502;
         logger.error(`bluesnap charge failed (amount=${amount}): ${msg}`, detail);
 
         const httpStatus = status === 402 ? 402 : 502;
         return res.status(httpStatus).json({
-            error:  'Payment could not be processed',
-            detail: msg,
+            error: 'Payment could not be processed',
         });
     }
 });
+
+interface BillingAddressBody {
+    street1?: unknown;
+    street2?: unknown;
+    city?: unknown;
+    state?: unknown;
+    zip?: unknown;
+    country?: unknown;
+    countryIso2?: unknown;
+}
 
 interface BcTokenBody {
     amount?: unknown;
@@ -181,6 +188,8 @@ interface BcTokenBody {
     cardHolderName?: unknown;
     customerId?: unknown;
     email?: unknown;
+    billingAddress?: BillingAddressBody;
+    orderDescription?: unknown;
 }
 
 interface BcPaymentMethod {
@@ -200,7 +209,15 @@ interface BcPaymentMethod {
  * Response: { token, orderId, storeHash, paymentMethodId }
  */
 router.post('/bc/token', async (req: Request, res: Response) => {
-    const { amount, currency = 'USD', cardHolderName = 'Guest User', customerId, email } = req.body as BcTokenBody;
+    const {
+        amount,
+        currency = 'USD',
+        cardHolderName = 'Guest User',
+        customerId,
+        email,
+        billingAddress,
+        orderDescription,
+    } = req.body as BcTokenBody;
 
     if (typeof amount !== 'number' || amount <= 0) {
         return res.status(400).json({ error: 'amount must be a positive number' });
@@ -211,7 +228,7 @@ router.post('/bc/token', async (req: Request, res: Response) => {
 
     const nameParts = typeof cardHolderName === 'string' ? cardHolderName.trim().split(' ') : ['Guest'];
     const firstName = nameParts[0] || 'Guest';
-    const lastName  = nameParts.slice(1).join(' ') || '';
+    const lastName = nameParts.slice(1).join(' ') || '';
 
     let bcCustomerId = 0;
     if (typeof customerId === 'number' && customerId > 0) {
@@ -223,29 +240,44 @@ router.post('/bc/token', async (req: Request, res: Response) => {
 
     const orderEmail = typeof email === 'string' && email.includes('@') ? email : 'guest@example.com';
 
+    const productName =
+        typeof orderDescription === 'string' && orderDescription.trim() ? orderDescription.trim() : 'Okuma Parts Order';
+
+    const street1 = typeof billingAddress?.street1 === 'string' ? billingAddress.street1.trim() : '';
+    const street2 = typeof billingAddress?.street2 === 'string' ? billingAddress.street2.trim() : undefined;
+    const city = typeof billingAddress?.city === 'string' ? billingAddress.city.trim() : '';
+    const state = typeof billingAddress?.state === 'string' ? billingAddress.state.trim() : '';
+    const zip = typeof billingAddress?.zip === 'string' ? billingAddress.zip.trim() : '';
+    const country = typeof billingAddress?.country === 'string' ? billingAddress.country.trim() : 'United States';
+    const countryIso2 =
+        typeof billingAddress?.countryIso2 === 'string' ? billingAddress.countryIso2.trim().toUpperCase() : 'US';
+
     try {
         // Step 1 — Create a BC order
         const orderRes = await bcClient.post<{ id: number }>('/v2/orders', {
-            status_id:   0,
+            status_id: 0,
             customer_id: bcCustomerId,
             billing_address: {
-                first_name:   firstName,
-                last_name:    lastName,
-                email:        orderEmail,
-                street_1:     '123 Demo Street',
-                city:         'Charlotte',
-                state:        'NC',
-                zip:          '28278',
-                country:      'United States',
-                country_iso2: 'US',
+                first_name: firstName,
+                last_name: lastName,
+                email: orderEmail,
+                street_1: street1,
+                ...(street2 ? { street_2: street2 } : {}),
+                city,
+                state,
+                zip,
+                country,
+                country_iso2: countryIso2,
             },
-            products: [{
-                name:          'Okuma Parts Order',
-                quantity:      1,
-                price_inc_tax: amount,
-                price_ex_tax:  amount,
-                weight:        0.1,
-            }],
+            products: [
+                {
+                    name: productName,
+                    quantity: 1,
+                    price_inc_tax: amount,
+                    price_ex_tax: amount,
+                    weight: 0.1,
+                },
+            ],
         });
         const orderId = orderRes.data.id;
         logger.info(`bc-token: order ${orderId} created`);
@@ -263,15 +295,18 @@ router.post('/bc/token', async (req: Request, res: Response) => {
                 `/v3/payments/methods?order_id=${orderId}`
             );
             const methods = methodsRes.data.data;
-            logger.info(`bc-token: available payment methods: ${JSON.stringify(methods.map(m => ({ id: m.id, instruments: m.supported_instruments })))}`);
+            logger.info(
+                `bc-token: available payment methods: ${JSON.stringify(methods.map(m => ({ id: m.id, instruments: m.supported_instruments })))}`
+            );
             // Prefer a card-instrument method; fall back to the first available method
-            const cardMethod = methods.find(m =>
-                m.supported_instruments?.some(i => /card/i.test(i.type))
-            ) ?? methods[0];
+            const cardMethod =
+                methods.find(m => m.supported_instruments?.some(i => /card/i.test(i.type))) ?? methods[0];
             if (cardMethod) paymentMethodId = cardMethod.id;
         } catch (methodsErr) {
             const axMethodsErr = methodsErr as AxiosError;
-            logger.warn(`bc-token: payment methods fetch failed (BC HTTP ${axMethodsErr.response?.status}): ${JSON.stringify(axMethodsErr.response?.data ?? (methodsErr as Error).message)}`);
+            logger.warn(
+                `bc-token: payment methods fetch failed (BC HTTP ${axMethodsErr.response?.status}): ${JSON.stringify(axMethodsErr.response?.data ?? (methodsErr as Error).message)}`
+            );
         }
 
         if (!paymentMethodId) {
@@ -283,20 +318,16 @@ router.post('/bc/token', async (req: Request, res: Response) => {
         return res.json({
             token,
             orderId,
-            storeHash:       config.bc.storeHash,
+            storeHash: config.bc.storeHash,
             paymentMethodId,
         });
-
     } catch (err) {
         const axErr = err as AxiosError;
         const bsStatus = axErr.response?.status;
-        const bsBody   = JSON.stringify(axErr.response?.data ?? {});
+        const bsBody = JSON.stringify(axErr.response?.data ?? {});
         logger.error(`bc-token failed (BC HTTP ${bsStatus}): ${bsBody}`);
         return res.status(502).json({ error: 'Could not initialise payment' });
     }
 });
 
 export default router;
-
-
-
