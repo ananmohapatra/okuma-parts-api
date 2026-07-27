@@ -1,3 +1,4 @@
+
 import path from 'path';
 import dotenv from 'dotenv';
 
@@ -17,11 +18,18 @@ interface BcConfig {
     channelId: number;
 }
 
+interface BluesnapConfig {
+    apiUsername: string | undefined;
+    apiPassword: string | undefined;
+    env: string;
+}
+
 interface AppConfig {
     port: number;
     trustProxy: boolean;
     sessionSecret: string | undefined;
     bc: BcConfig;
+    bluesnap: BluesnapConfig;
     partsBook: {
         cdnBaseUrl: string | undefined;
     };
@@ -50,6 +58,11 @@ const config: AppConfig = {
             return Number.isFinite(parsed) ? parsed : 1;
         })(),
     },
+    bluesnap: {
+        apiUsername: process.env.BLUESNAP_API_USERNAME,
+        apiPassword: process.env.BLUESNAP_API_PASSWORD,
+        env:         process.env.BLUESNAP_ENV ?? 'sandbox',
+    },
     partsBook: {
         cdnBaseUrl: process.env.PARTS_BOOK_CDN_BASE_URL,
     },
@@ -66,3 +79,6 @@ if (missing.length) {
 }
 
 export default config;
+
+
+

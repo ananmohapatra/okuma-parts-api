@@ -1,3 +1,4 @@
+
 import { Router } from 'express';
 import { rateLimit } from 'express-rate-limit';
 import authenticateBCToken from '../middleware/auth';
@@ -11,6 +12,7 @@ import customers from './customers';
 import cart from './cart';
 import dashboard from './dashboard';
 import partsSearch from './parts-search';
+import payments from './payments';
 
 const router = Router();
 // Rate limiter
@@ -27,6 +29,7 @@ const apiLimiter = rateLimit({
 router.use('/health', health);
 router.use('/auth', auth);
 router.use('/webhooks', webhooks);
+router.use('/payments', payments);
 
 // Versioned API (auth-gated, server-to-server)
 router.use('/v1/api', apiLimiter, authenticateBCToken, v1Router);
