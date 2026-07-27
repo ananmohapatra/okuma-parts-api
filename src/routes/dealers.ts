@@ -129,6 +129,7 @@ interface B2BAddressDetailResponse {
 
 type DealerAddressApprovalStatus = 'pending' | 'approved' | 'rejected';
 const DEALER_APPROVAL_FIELD = 'Approval Status';
+const DEALER_REJECTION_REMARKS_FIELD = 'Rejection Remarks';
 
 /**
  * Fetch all BC customer groups and return a map of id → name.
@@ -722,6 +723,13 @@ function getDealerAddressApprovalStatus(extraFields?: B2BAddressExtraFieldEntry[
     return null;
 }
 
+function getDealerRejectionRemarks(extraFields?: B2BAddressExtraFieldEntry[]): string | null {
+    const field = (extraFields ?? []).find(
+        f => f.fieldName.trim().toLowerCase() === DEALER_REJECTION_REMARKS_FIELD.toLowerCase()
+    );
+    return field?.fieldValue ?? null;
+}
+
 // List endpoint omits extraFields — a detail call per address is required to read Approval Status.
 async function fetchB2BAddressDetail(addressId: number): Promise<B2BAddressItem | null> {
     try {
@@ -771,6 +779,7 @@ function mapDealerAddress(a: B2BAddressItem, companyName: string) {
         isDefaultBilling: a.isDefaultBilling,
         isDefaultShipping: a.isDefaultShipping,
         approvalStatus: getDealerAddressApprovalStatus(a.extraFields),
+        rejectionRemarks: getDealerRejectionRemarks(a.extraFields),
         createdAt: a.createdAt,
         updatedAt: a.updatedAt,
     };

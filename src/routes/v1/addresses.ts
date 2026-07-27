@@ -7,8 +7,9 @@ import logger from '../../config/logger';
 
 const router = Router();
 
-// Pre-configured B2B address extra field name for the approval workflow
+// Pre-configured B2B address extra field names for the approval workflow
 const APPROVAL_STATUS_FIELD = 'Approval Status';
+const REJECTION_REMARKS_FIELD = 'Rejection Remarks';
 type ApprovalStatus = 'pending' | 'approved' | 'rejected';
 
 // ---------------------------------------------------------------------------
@@ -93,6 +94,13 @@ function getApprovalStatus(extraFields?: B2BAddressExtraField[]): ApprovalStatus
     return null;
 }
 
+function getRejectionRemarks(extraFields?: B2BAddressExtraField[]): string | null {
+    const field = (extraFields ?? []).find(
+        f => f.fieldName.trim().toLowerCase() === REJECTION_REMARKS_FIELD.toLowerCase()
+    );
+    return field?.fieldValue ?? null;
+}
+
 function mapAddress(a: B2BAddress) {
     return {
         addressId: a.addressId,
@@ -117,6 +125,7 @@ function mapAddress(a: B2BAddress) {
         createdAt: a.createdAt ?? null,
         updatedAt: a.updatedAt ?? null,
         approvalStatus: getApprovalStatus(a.extraFields),
+        rejectionRemarks: getRejectionRemarks(a.extraFields),
     };
 }
 
@@ -142,8 +151,14 @@ async function fetchAddressById(addressId: string): Promise<B2BAddress | null> {
     }
 }
 
-async function applyApprovalStatus(address: B2BAddress, status: ApprovalStatus): Promise<void> {
-    const otherFields = (address.extraFields ?? []).filter(f => f.fieldName !== APPROVAL_STATUS_FIELD);
+async function applyApprovalStatus(
+    address: B2BAddress,
+    status: ApprovalStatus,
+    rejectionRemarks?: string
+): Promise<void> {
+    const otherFields = (address.extraFields ?? []).filter(
+        f => f.fieldName !== APPROVAL_STATUS_FIELD && f.fieldName !== REJECTION_REMARKS_FIELD
+    );
 
     // Approved → enable for both shipping and billing.
     // Pending / rejected → locked (false) so the address cannot be selected at checkout.
@@ -165,7 +180,13 @@ async function applyApprovalStatus(address: B2BAddress, status: ApprovalStatus):
         isDefaultBilling: false,
         isDefaultShipping: false,
         companyId: Number(address.companyId),
-        extraFields: [...otherFields, { fieldName: APPROVAL_STATUS_FIELD, fieldValue: status }],
+        extraFields: [
+            ...otherFields,
+            { fieldName: APPROVAL_STATUS_FIELD, fieldValue: status },
+            ...(status === 'rejected' && rejectionRemarks
+                ? [{ fieldName: REJECTION_REMARKS_FIELD, fieldValue: rejectionRemarks }]
+                : []),
+        ],
     });
 }
 
@@ -435,8 +456,9 @@ async function authorizeAddressAction(
         return { error: `Address ${addressId} not found`, status: 404 };
     }
 
-    if (getApprovalStatus(address.extraFields) !== 'pending') {
-        return { error: 'Only pending addresses can be approved or rejected', status: 422 };
+    const currentStatus = getApprovalStatus(address.extraFields);
+    if (currentStatus !== 'pending' && currentStatus !== null) {
+        return { error: 'Only pending (or unreviewed) addresses can be approved or rejected', status: 422 };
     }
 
     const addressCompany = await fetchB2BCompanyById(Number(address.companyId));
@@ -454,6 +476,7 @@ async function authorizeAddressAction(
 interface BulkActionItem {
     addressId: unknown;
     action: unknown;
+    rejectionRemarks?: unknown;
 }
 
 interface BulkActionResult {
@@ -493,6 +516,14 @@ router.patch('/addresses/:distributorId', async (req: Request, res: Response) =>
         return res.status(400).json({ error: `action must be "approve" or "reject", got: ${invalidAction.action}` });
     }
 
+    const invalidRemarks = (items as BulkActionItem[]).find(
+        item =>
+            item.action === 'reject' && item.rejectionRemarks !== undefined && typeof item.rejectionRemarks !== 'string'
+    );
+    if (invalidRemarks) {
+        return res.status(400).json({ error: 'rejectionRemarks must be a string when action is "reject"' });
+    }
+
     // Resolve distributor once — fails fast if not a valid distributor
     const distributorAccountNumber = await resolveDistributorAccountNumber(distributorId);
     if (!distributorAccountNumber) {
@@ -509,7 +540,8 @@ router.patch('/addresses/:distributorId', async (req: Request, res: Response) =>
                 if ('error' in auth) {
                     return { addressId: Number(addrId), error: auth.error };
                 }
-                await applyApprovalStatus(auth.address, newStatus);
+                const remarks = item.action === 'reject' ? (item.rejectionRemarks as string | undefined) : undefined;
+                await applyApprovalStatus(auth.address, newStatus, remarks);
                 logger.info(`Address ${addrId} ${newStatus} by distributor ${distributorId}`);
                 return { addressId: Number(addrId), approvalStatus: newStatus };
             } catch (err) {
