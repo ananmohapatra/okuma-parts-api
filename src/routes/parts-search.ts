@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import bcClient from '../services/bigcommerce';
 import fetchCustomerProfile from '../services/customerProfile';
+import { fetchLocationInventory, resolveStock, resolveDealerLocationId, BcInventoryItem } from '../services/inventory';
 import logger from '../config/logger';
 import config from '../config';
 
@@ -18,48 +19,6 @@ interface BcSearchProduct {
     availability: string;
     inventory_tracking: 'none' | 'product' | 'variant';
     inventory_level: number;
-}
-
-interface BcInventoryLocation {
-    available_to_sell: number;
-}
-
-interface BcInventoryItem {
-    identity: { product_id: number };
-    locations: BcInventoryLocation[];
-}
-
-/**
- * Fetch MSI (multi-location) inventory and return total available_to_sell per product.
- * Only called for products that have inventory_tracking !== 'none'.
- * BC stores stock per location; the top-level product inventory_level field is 0
- * when MSI is enabled and does not aggregate across locations.
- */
-async function fetchMsiAvailable(productIds: number[]): Promise<Record<number, number>> {
-    const totalByProductId: Record<number, number> = {};
-    const limit = 250;
-    let page = 1;
-
-    while (true) {
-        const res = await bcClient.get<{
-            data: BcInventoryItem[];
-            meta?: { pagination?: { current_page: number; total_pages: number } };
-        }>('/v3/inventory/items', {
-            params: { 'product_id:in': productIds.join(','), limit, page },
-        });
-
-        (res.data?.data ?? []).forEach(item => {
-            const sum = (item.locations ?? []).reduce((acc, loc) => acc + (loc.available_to_sell ?? 0), 0);
-            const productId = item.identity.product_id;
-            totalByProductId[productId] = (totalByProductId[productId] ?? 0) + sum;
-        });
-
-        const pagination = res.data?.meta?.pagination;
-        if (!pagination || pagination.current_page >= pagination.total_pages) break;
-        page += 1;
-    }
-
-    return totalByProductId;
 }
 
 interface BcPricingItem {
@@ -83,6 +42,8 @@ interface PartResult {
     originalPrice: number | null;
     status: string;
     stockStatus: 'instock' | 'backorder';
+    stockSource: 'dealer' | 'okuma' | 'none';
+    availableStock: number | null;
     shippingDetails: string;
 }
 
@@ -123,33 +84,46 @@ async function fetchPricing(
  *
  * Dealer part search by part number or name (Order for Self — not machine-scoped).
  * Combines BC's native keyword search (matches sku + name + description in one call)
- * with dealer-specific pricing resolved via the customer's customer_group_id.
+ * with dealer-specific pricing and per-location inventory.
  *
- * fetchCustomerProfile() and the catalog search run in parallel — neither depends on
- * the other's result. Pricing runs after, since it needs both the resolved
- * customer_group_id and the product IDs from the search results.
+ * Stock priority:
+ *   1. Dealer's inventory location (dealerLocationId) — if provided and has stock.
+ *   2. Okuma US Warehouse location — matched by name containing "okuma".
+ *   3. backorder — no stock at either source.
  *
- * If a customer session was bound (POST /customer/:customerId/session), customerId
- * must match it — otherwise a caller could request another customer's group pricing
- * simply by changing the query param.
+ * dealerLocationId comes from the Stencil theme, which resolves it from the
+ * logged-in user's B2B session (the distributor's BC inventory location ID).
+ * BC does not aggregate multi-location stock into inventory_level, so we must
+ * query /v3/inventory/items for per-location quantities.
  *
  * Query params:
- *   q          — required, search term (matched against SKU, name, description)
- *   customerId — required, BC customer ID of the logged-in dealer
- *   sort       — optional, "name_asc" | "name_desc"
- *   page       — optional, default 1, must be a positive integer
- *   limit      — optional, default 50, must be a positive integer, capped at 100
+ *   q               — required, search term (matched against SKU, name, description)
+ *   customerId      — required, BC customer ID of the logged-in dealer
+ *   dealerLocationId — optional, BC inventory location ID for the dealer's warehouse
+ *   sort            — optional, "name_asc" | "name_desc"
+ *   page            — optional, default 1, must be a positive integer
+ *   limit           — optional, default 50, must be a positive integer, capped at 100
  *
- * Response: { total, page, limit, results: [{ productId, partNumber, partName, description, unitPrice, originalPrice, status, stockStatus, shippingDetails }] }
+ * Response: { total, page, limit, results: [{ productId, partNumber, partName, description, unitPrice, originalPrice, status, stockStatus, stockSource, shippingDetails }] }
  */
 router.get('/parts/search', async (req: Request, res: Response) => {
-    const { q, customerId, sort, page = '1', limit = String(DEFAULT_LIMIT) } = req.query as Record<string, string>;
+    const {
+        q,
+        customerId,
+        dealerLocationId,
+        sort,
+        page = '1',
+        limit = String(DEFAULT_LIMIT),
+    } = req.query as Record<string, string>;
 
     if (!q || !q.trim()) {
         return res.status(400).json({ error: 'q (search term) is required.' });
     }
     if (!customerId || !/^\d+$/.test(customerId)) {
         return res.status(400).json({ error: 'customerId is required and must be numeric.' });
+    }
+    if (dealerLocationId !== undefined && !/^[1-9]\d*$/.test(dealerLocationId)) {
+        return res.status(400).json({ error: 'dealerLocationId must be a positive integer when provided.' });
     }
     if (sort !== undefined && sort !== 'name_asc' && sort !== 'name_desc') {
         return res.status(400).json({ error: 'sort must be "name_asc" or "name_desc" when provided.' });
@@ -175,11 +149,12 @@ router.get('/parts/search', async (req: Request, res: Response) => {
     else if (sort === 'name_desc') sortParams = { sort: 'name', direction: 'desc' };
 
     try {
-        const [profile, searchRes] = await Promise.all([
+        const [profile, searchRes, resolvedDealerLocId] = await Promise.all([
             fetchCustomerProfile(customerId),
             bcClient.get<{ data: BcSearchProduct[]; meta: { pagination: { total: number } } }>('/v3/catalog/products', {
                 params: { keyword: q.trim(), page, limit: limitNum, ...sortParams },
             }),
+            dealerLocationId ? Promise.resolve(parseInt(dealerLocationId, 10)) : resolveDealerLocationId(customerId),
         ]);
 
         if (!profile) {
@@ -189,34 +164,42 @@ router.get('/parts/search', async (req: Request, res: Response) => {
         const products = searchRes.data?.data ?? [];
         const total = searchRes.data?.meta?.pagination?.total ?? 0;
 
-        const trackedProductIds = products.filter(p => p.inventory_tracking !== 'none').map(p => p.id);
+        const skus = [...new Set(products.filter(p => p.sku).map(p => p.sku))];
 
-        const [priceByProductId, msiAvailableById] = await Promise.all([
+        const [priceByProductId, inventoryBySku] = await Promise.all([
             products.length > 0
                 ? fetchPricing(
                       products.map(p => p.id),
                       profile.customer_group_id
                   )
-                : ({} as Record<number, PricingResult>),
-            trackedProductIds.length > 0
-                ? fetchMsiAvailable(trackedProductIds)
-                : ({} as Record<number, number>),
+                : Promise.resolve({} as Record<number, PricingResult>),
+            skus.length > 0 ? fetchLocationInventory(skus) : Promise.resolve({} as Record<string, BcInventoryItem>),
         ]);
 
+        const dealerLocId = resolvedDealerLocId;
+
         const results: PartResult[] = products.map(p => {
-            let inStock: boolean;
-            if (p.availability !== 'available') {
-                inStock = false;
-            } else if (p.inventory_tracking === 'none') {
-                inStock = false;
-            } else {
-                // Use MSI aggregate — product-level inventory_level is 0 when multi-location is enabled
-                const totalAvailable = msiAvailableById[p.id] ?? p.inventory_level;
-                inStock = totalAvailable > 0;
-            }
-            const stockStatus = inStock ? 'instock' : 'backorder';
-            const shippingDetails = inStock ? 'Ships in 1-3 business days' : 'Will be shipped once available';
             const pricing = priceByProductId[p.id] ?? { unitPrice: null, originalPrice: null };
+
+            let stockResult;
+            if (p.availability !== 'available') {
+                stockResult = {
+                    inStock: false,
+                    stockSource: 'none' as const,
+                    availableStock: null,
+                    shippingDetails: 'Will be shipped once available',
+                };
+            } else if (p.inventory_tracking === 'none') {
+                stockResult = {
+                    inStock: true,
+                    stockSource: 'okuma' as const,
+                    availableStock: null,
+                    shippingDetails: 'Ships from Okuma in 5-7 business days',
+                };
+            } else {
+                stockResult = resolveStock(inventoryBySku[p.sku], dealerLocId);
+            }
+
             return {
                 productId: p.id,
                 partNumber: p.sku,
@@ -225,8 +208,10 @@ router.get('/parts/search', async (req: Request, res: Response) => {
                 unitPrice: pricing.unitPrice,
                 originalPrice: pricing.originalPrice,
                 status: p.availability,
-                stockStatus,
-                shippingDetails,
+                stockStatus: stockResult.inStock ? 'instock' : 'backorder',
+                stockSource: stockResult.stockSource,
+                availableStock: stockResult.availableStock,
+                shippingDetails: stockResult.shippingDetails,
             };
         });
 

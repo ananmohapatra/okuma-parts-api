@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { AxiosError } from 'axios';
 import bcClient from '../services/bigcommerce';
+import { fetchLocationInventory, resolveStock, resolveDealerLocationId, BcInventoryItem } from '../services/inventory';
 import logger from '../config/logger';
 import config from '../config';
 
@@ -47,6 +48,9 @@ interface AddItemBody {
     quantity?: unknown;
     variantId?: unknown;
     customerId?: unknown;
+    sku?: unknown;
+    dealerLocationId?: unknown;
+    inventoryTracking?: unknown;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +152,15 @@ async function appendCartItem(
  * }
  */
 router.post('/cart/items', async (req: Request, res: Response) => {
-    const { productId, quantity = 1, variantId, customerId } = req.body as AddItemBody;
+    const {
+        productId,
+        quantity = 1,
+        variantId,
+        customerId,
+        sku,
+        dealerLocationId,
+        inventoryTracking,
+    } = req.body as AddItemBody;
 
     if (!productId || typeof productId !== 'number' || !Number.isInteger(productId) || productId <= 0) {
         return res.status(400).json({ error: 'productId must be a positive integer.' });
@@ -165,10 +177,30 @@ router.post('/cart/items', async (req: Request, res: Response) => {
     ) {
         return res.status(400).json({ error: 'customerId must be a positive integer.' });
     }
+    if (sku !== undefined && typeof sku !== 'string') {
+        return res.status(400).json({ error: 'sku must be a string when provided.' });
+    }
+    if (
+        dealerLocationId !== undefined &&
+        (typeof dealerLocationId !== 'number' || !Number.isInteger(dealerLocationId) || dealerLocationId <= 0)
+    ) {
+        return res.status(400).json({ error: 'dealerLocationId must be a positive integer when provided.' });
+    }
 
     const session = req.session as unknown as { customerId?: string };
     if (customerId !== undefined && session.customerId && session.customerId !== String(customerId)) {
         return res.status(403).json({ error: 'Forbidden.' });
+    }
+
+    // Kick off stock fetch and dealer location resolution in parallel with cart operation.
+    const stockFetchPromise: Promise<Record<string, BcInventoryItem>> =
+        typeof sku === 'string' ? fetchLocationInventory([sku]) : Promise.resolve({});
+    let dealerLocPromise: Promise<number | null> = Promise.resolve(null);
+    if (typeof sku === 'string' && customerId) {
+        dealerLocPromise =
+            typeof dealerLocationId === 'number'
+                ? Promise.resolve(dealerLocationId)
+                : resolveDealerLocationId(String(customerId));
     }
 
     try {
@@ -204,9 +236,27 @@ router.post('/cart/items', async (req: Request, res: Response) => {
 
         setCartId(req, cart.id);
 
-        const redirectUrls = await fetchRedirectUrls(cart.id);
+        const [redirectUrls, invMap, dealerLocId] = await Promise.all([
+            fetchRedirectUrls(cart.id),
+            stockFetchPromise,
+            dealerLocPromise,
+        ]);
 
         const physicalItems = cart.line_items?.physical_items ?? [];
+
+        let stockResult: ReturnType<typeof resolveStock> | null = null;
+        if (typeof sku === 'string') {
+            if (inventoryTracking === 'none') {
+                stockResult = {
+                    inStock: true,
+                    stockSource: 'okuma',
+                    availableStock: null,
+                    shippingDetails: 'Ships from Okuma in 5-7 business days',
+                };
+            } else {
+                stockResult = resolveStock(invMap[sku], dealerLocId);
+            }
+        }
 
         return res.status(201).json({
             cartId: cart.id,
@@ -233,13 +283,24 @@ router.post('/cart/items', async (req: Request, res: Response) => {
                 checkoutUrl: redirectUrls.checkout_url,
                 embeddedCheckoutUrl: redirectUrls.embedded_checkout_url,
             },
+            ...(stockResult !== null && {
+                stockSource: stockResult.stockSource,
+                availableStock: stockResult.availableStock,
+                shippingDetails: stockResult.shippingDetails,
+            }),
         });
     } catch (err) {
         const axErr = err as import('axios').AxiosError;
+        const bcStatus = axErr.response?.status;
         const detail = axErr.response
-            ? `BC ${axErr.response.status}: ${JSON.stringify(axErr.response.data)}`
+            ? `BC ${bcStatus}: ${JSON.stringify(axErr.response.data)}`
             : (err as Error).message;
         logger.error(`cart add item failed (productId=${productId}): ${detail}`);
+        if (bcStatus === 422) {
+            return res
+                .status(422)
+                .json({ error: 'This item cannot be added to cart — it may be out of stock or unavailable.' });
+        }
         return res.status(500).json({ error: 'Could not add item to cart.' });
     }
 });

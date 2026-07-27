@@ -48,8 +48,6 @@ const SHEET_SLUG = 'sheet-no-1';
 // Fixtures
 // ---------------------------------------------------------------------------
 
-const MOCK_MANIFEST = { documents: [DOC_ID] };
-
 const MOCK_DOC = {
     id: DOC_ID,
     label: 'LU300-M',
@@ -106,13 +104,27 @@ const MOCK_PARTS_DATA = {
     ],
 };
 
+const MOCK_TOC = { documents: [MOCK_DOC] };
+
 const MOCK_BC_PRODUCT = {
     id: 42,
     sku: '525-0000-01-01',
     price: 199.99,
-    inventory_level: 5,
     inventory_tracking: 'product',
     availability: 'available',
+};
+
+const MOCK_INVENTORY_ITEM = {
+    identity: { sku: '525-0000-01-01', product_id: 42 },
+    locations: [
+        {
+            location_id: 1,
+            location_code: 'WH01',
+            location_name: 'Okuma US Warehouse',
+            available_to_sell: 10,
+            location_enabled: true,
+        },
+    ],
 };
 
 // ---------------------------------------------------------------------------
@@ -176,10 +188,8 @@ describe('Parts Book API', () => {
     // -----------------------------------------------------------------------
 
     describe('GET /v1/api/parts-book/toc', () => {
-        it('fetches index.json then each document index.json and returns rewritten CDN paths', async () => {
-            mockAxiosGet
-                .mockResolvedValueOnce({ data: MOCK_MANIFEST })
-                .mockResolvedValueOnce({ data: MOCK_DOC });
+        it('fetches toc.json and returns documents with rewritten CDN paths', async () => {
+            mockAxiosGet.mockResolvedValueOnce({ data: MOCK_TOC });
 
             const res = await request(app).get('/v1/api/parts-book/toc').set(AUTH);
 
@@ -202,26 +212,19 @@ describe('Parts Book API', () => {
             );
         });
 
-        it('requests the correct CDN URLs for manifest and per-doc index', async () => {
-            mockAxiosGet
-                .mockResolvedValueOnce({ data: MOCK_MANIFEST })
-                .mockResolvedValueOnce({ data: MOCK_DOC });
+        it('requests the correct toc.json CDN URL', async () => {
+            mockAxiosGet.mockResolvedValueOnce({ data: MOCK_TOC });
 
             await request(app).get('/v1/api/parts-book/toc').set(AUTH);
 
-            expect(mockAxiosGet).toHaveBeenNthCalledWith(
-                1,
-                `${CDN_BASE}/index.json`,
-                expect.objectContaining({ timeout: 15000 })
-            );
-            expect(mockAxiosGet).toHaveBeenNthCalledWith(
-                2,
-                `${CDN_BASE}/${DOC_ID}/index.json`,
+            expect(mockAxiosGet).toHaveBeenCalledTimes(1);
+            expect(mockAxiosGet).toHaveBeenCalledWith(
+                `${CDN_BASE}/toc.json`,
                 expect.objectContaining({ timeout: 15000 })
             );
         });
 
-        it('returns 500 when root index.json is unavailable', async () => {
+        it('returns 500 when toc.json is unavailable', async () => {
             mockAxiosGet.mockRejectedValue(new Error('Network error'));
 
             const res = await request(app).get('/v1/api/parts-book/toc').set(AUTH);
@@ -229,36 +232,33 @@ describe('Parts Book API', () => {
             expect(res.status).toBe(500);
         });
 
-        it('returns 500 when index.json documents array is empty', async () => {
+        it('returns 200 with empty documents list when toc.json has no documents', async () => {
             mockAxiosGet.mockResolvedValueOnce({ data: { documents: [] } });
 
             const res = await request(app).get('/v1/api/parts-book/toc').set(AUTH);
 
-            expect(res.status).toBe(500);
+            expect(res.status).toBe(200);
+            expect(res.body.documents).toHaveLength(0);
         });
 
-        it('returns 500 when all per-doc index.json files fail to load', async () => {
-            mockAxiosGet
-                .mockResolvedValueOnce({ data: MOCK_MANIFEST })
-                .mockRejectedValue(new Error('CDN error'));
+        it('returns 500 when toc.json fails to load', async () => {
+            mockAxiosGet.mockRejectedValue(new Error('CDN error'));
 
             const res = await request(app).get('/v1/api/parts-book/toc').set(AUTH);
 
             expect(res.status).toBe(500);
         });
 
-        it('returns only the documents that loaded successfully when some fail', async () => {
-            const DOC_2 = 'MISSING-DOC';
-            mockAxiosGet
-                .mockResolvedValueOnce({ data: { documents: [DOC_ID, DOC_2] } })
-                .mockResolvedValueOnce({ data: MOCK_DOC })
-                .mockRejectedValue(new Error('CDN error'));
+        it('returns all documents from toc.json', async () => {
+            const MOCK_DOC_2 = { ...MOCK_DOC, id: 'DOC-2', label: 'Other Machine' };
+            mockAxiosGet.mockResolvedValueOnce({ data: { documents: [MOCK_DOC, MOCK_DOC_2] } });
 
             const res = await request(app).get('/v1/api/parts-book/toc').set(AUTH);
 
             expect(res.status).toBe(200);
-            expect(res.body.documents).toHaveLength(1);
+            expect(res.body.documents).toHaveLength(2);
             expect(res.body.documents[0].id).toBe(DOC_ID);
+            expect(res.body.documents[1].id).toBe('DOC-2');
         });
     });
 
@@ -303,9 +303,11 @@ describe('Parts Book API', () => {
 
         it('returns parts with sheet metadata and BC price/stock data', async () => {
             mockAxiosGet
-                .mockResolvedValueOnce({ data: MOCK_DOC })
+                .mockResolvedValueOnce({ data: MOCK_TOC })
                 .mockResolvedValueOnce({ data: MOCK_PARTS_DATA });
-            mockBcGet.mockResolvedValue({ data: { data: [MOCK_BC_PRODUCT] } });
+            mockBcGet
+                .mockResolvedValueOnce({ data: { data: [MOCK_BC_PRODUCT] } })       // catalog/products
+                .mockResolvedValueOnce({ data: { data: [MOCK_INVENTORY_ITEM] } });  // inventory/items
 
             const res = await request(app).get(PARTS_URL).set(AUTH);
 
@@ -330,7 +332,7 @@ describe('Parts Book API', () => {
 
         it('converts callout_box_2d [ymin,xmin,ymax,xmax] to percentage centre coords', async () => {
             mockAxiosGet
-                .mockResolvedValueOnce({ data: MOCK_DOC })
+                .mockResolvedValueOnce({ data: MOCK_TOC })
                 .mockResolvedValueOnce({ data: MOCK_PARTS_DATA });
             mockBcGet.mockResolvedValue({ data: { data: [] } });
 
@@ -343,7 +345,7 @@ describe('Parts Book API', () => {
 
         it('converts table_row_box_2d to percentage centre coords', async () => {
             mockAxiosGet
-                .mockResolvedValueOnce({ data: MOCK_DOC })
+                .mockResolvedValueOnce({ data: MOCK_TOC })
                 .mockResolvedValueOnce({ data: MOCK_PARTS_DATA });
             mockBcGet.mockResolvedValue({ data: { data: [] } });
 
@@ -357,7 +359,7 @@ describe('Parts Book API', () => {
         it('returns null callout coords when callout_box_2d is absent', async () => {
             const partsNoCoords = { parts: [{ box_id: 'p1', part_no: 'SKU-1', has_table_match: false }] };
             mockAxiosGet
-                .mockResolvedValueOnce({ data: MOCK_DOC })
+                .mockResolvedValueOnce({ data: MOCK_TOC })
                 .mockResolvedValueOnce({ data: partsNoCoords });
 
             const res = await request(app).get(PARTS_URL).set(AUTH);
@@ -370,7 +372,7 @@ describe('Parts Book API', () => {
         it('skips BC product lookup when no parts have has_table_match=true', async () => {
             const noMatch = { parts: [{ box_id: 'p1', part_no: 'SKU-1', has_table_match: false }] };
             mockAxiosGet
-                .mockResolvedValueOnce({ data: MOCK_DOC })
+                .mockResolvedValueOnce({ data: MOCK_TOC })
                 .mockResolvedValueOnce({ data: noMatch });
 
             const res = await request(app).get(PARTS_URL).set(AUTH);
@@ -381,7 +383,7 @@ describe('Parts Book API', () => {
 
         it('returns parts with null price when BC lookup throws', async () => {
             mockAxiosGet
-                .mockResolvedValueOnce({ data: MOCK_DOC })
+                .mockResolvedValueOnce({ data: MOCK_TOC })
                 .mockResolvedValueOnce({ data: MOCK_PARTS_DATA });
             mockBcGet.mockRejectedValue(new Error('BC unavailable'));
 
@@ -393,12 +395,14 @@ describe('Parts Book API', () => {
             expect(res.body.parts[0].productId).toBeNull();
         });
 
-        it('marks part as in-stock when inventory_tracking is "none" regardless of inventory_level', async () => {
-            const untrackedProduct = { ...MOCK_BC_PRODUCT, inventory_tracking: 'none', inventory_level: 0 };
+        it('marks part as in-stock when inventory_tracking is "none" regardless of per-location inventory', async () => {
+            const untrackedProduct = { ...MOCK_BC_PRODUCT, inventory_tracking: 'none' };
             mockAxiosGet
-                .mockResolvedValueOnce({ data: MOCK_DOC })
+                .mockResolvedValueOnce({ data: MOCK_TOC })
                 .mockResolvedValueOnce({ data: MOCK_PARTS_DATA });
-            mockBcGet.mockResolvedValue({ data: { data: [untrackedProduct] } });
+            mockBcGet
+                .mockResolvedValueOnce({ data: { data: [untrackedProduct] } })  // catalog/products
+                .mockResolvedValueOnce({ data: { data: [] } });                 // inventory/items — empty; tracking=none so still in stock
 
             const res = await request(app).get(PARTS_URL).set(AUTH);
 
@@ -408,17 +412,44 @@ describe('Parts Book API', () => {
         it('marks part as out-of-stock when availability is not "available"', async () => {
             const disabledProduct = { ...MOCK_BC_PRODUCT, availability: 'disabled' };
             mockAxiosGet
-                .mockResolvedValueOnce({ data: MOCK_DOC })
+                .mockResolvedValueOnce({ data: MOCK_TOC })
                 .mockResolvedValueOnce({ data: MOCK_PARTS_DATA });
-            mockBcGet.mockResolvedValue({ data: { data: [disabledProduct] } });
+            mockBcGet
+                .mockResolvedValueOnce({ data: { data: [disabledProduct] } })  // catalog/products
+                .mockResolvedValueOnce({ data: { data: [] } });                // inventory/items
 
             const res = await request(app).get(PARTS_URL).set(AUTH);
 
             expect(res.body.parts[0].inStock).toBe(false);
         });
 
-        it('returns 404 when document is not found on CDN', async () => {
-            mockAxiosGet.mockRejectedValue(new Error('Not Found'));
+        it('marks part as out-of-stock when tracked and no location has available stock', async () => {
+            const noStockItem = {
+                identity: { sku: '525-0000-01-01', product_id: 42 },
+                locations: [
+                    {
+                        location_id: 1,
+                        location_code: 'WH01',
+                        location_name: 'Okuma US Warehouse',
+                        available_to_sell: 0,
+                        location_enabled: true,
+                    },
+                ],
+            };
+            mockAxiosGet
+                .mockResolvedValueOnce({ data: MOCK_TOC })
+                .mockResolvedValueOnce({ data: MOCK_PARTS_DATA });
+            mockBcGet
+                .mockResolvedValueOnce({ data: { data: [MOCK_BC_PRODUCT] } })  // catalog/products — availability: available, tracking: product
+                .mockResolvedValueOnce({ data: { data: [noStockItem] } });     // inventory/items — all locations at 0
+
+            const res = await request(app).get(PARTS_URL).set(AUTH);
+
+            expect(res.body.parts[0].inStock).toBe(false);
+        });
+
+        it('returns 404 when document is not found in toc.json', async () => {
+            mockAxiosGet.mockResolvedValueOnce({ data: { documents: [] } });
 
             const res = await request(app).get(PARTS_URL).set(AUTH);
 
@@ -427,9 +458,7 @@ describe('Parts Book API', () => {
 
         it('returns 404 when assembly slug does not exist in the document', async () => {
             const docNoAsm = { ...MOCK_DOC, assemblies: [] };
-            mockAxiosGet
-                .mockResolvedValueOnce({ data: docNoAsm })
-                .mockResolvedValueOnce({ data: MOCK_PARTS_DATA });
+            mockAxiosGet.mockResolvedValueOnce({ data: { documents: [docNoAsm] } });
 
             const res = await request(app).get(PARTS_URL).set(AUTH);
 
@@ -441,9 +470,7 @@ describe('Parts Book API', () => {
                 ...MOCK_DOC,
                 assemblies: [{ ...MOCK_DOC.assemblies[0], sheets: [] }],
             };
-            mockAxiosGet
-                .mockResolvedValueOnce({ data: docNoSheet })
-                .mockResolvedValueOnce({ data: MOCK_PARTS_DATA });
+            mockAxiosGet.mockResolvedValueOnce({ data: { documents: [docNoSheet] } });
 
             const res = await request(app).get(PARTS_URL).set(AUTH);
 
@@ -452,7 +479,7 @@ describe('Parts Book API', () => {
 
         it('returns 500 when parts.json is unavailable', async () => {
             mockAxiosGet
-                .mockResolvedValueOnce({ data: MOCK_DOC })
+                .mockResolvedValueOnce({ data: MOCK_TOC })
                 .mockRejectedValue(new Error('CDN error'));
 
             const res = await request(app).get(PARTS_URL).set(AUTH);
@@ -479,7 +506,7 @@ describe('Parts Book API', () => {
                 ],
             };
             mockAxiosGet
-                .mockResolvedValueOnce({ data: docWithSub })
+                .mockResolvedValueOnce({ data: { documents: [docWithSub] } })
                 .mockResolvedValueOnce({ data: MOCK_PARTS_DATA });
             mockBcGet.mockResolvedValue({ data: { data: [] } });
 

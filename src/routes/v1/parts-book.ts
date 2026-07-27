@@ -4,6 +4,7 @@ import config from '../../config';
 import logger from '../../config/logger';
 import bcClient from '../../services/bigcommerce';
 import b2bClient from '../../services/b2b';
+import { fetchLocationInventory, hasAnyStock } from '../../services/inventory';
 import { AppError, NotFoundError } from '../../middleware/errors';
 
 const router = Router();
@@ -73,7 +74,6 @@ interface BcProduct {
     id: number;
     sku: string;
     price: number;
-    inventory_level: number;
     inventory_tracking: string;
     availability: string;
 }
@@ -229,18 +229,22 @@ router.get(
 
             if (matchedSkus.length > 0) {
                 try {
-                    const response = await bcClient.get<{ data: BcProduct[] }>('/v3/catalog/products', {
-                        params: {
-                            'sku:in': matchedSkus.join(','),
-                            limit: 50,
-                            include_fields: 'id,sku,name,price,inventory_level,inventory_tracking,availability',
-                        },
-                    });
+                    const [response, inventoryBySku] = await Promise.all([
+                        bcClient.get<{ data: BcProduct[] }>('/v3/catalog/products', {
+                            params: {
+                                'sku:in': matchedSkus.join(','),
+                                limit: 50,
+                                include_fields: 'id,sku,name,price,inventory_tracking,availability',
+                            },
+                        }),
+                        fetchLocationInventory(matchedSkus),
+                    ]);
 
                     (response.data?.data ?? []).forEach(product => {
                         const notTracked = product.inventory_tracking === 'none';
                         const inStock =
-                            product.availability === 'available' && (notTracked || product.inventory_level > 0);
+                            product.availability === 'available' &&
+                            (notTracked || hasAnyStock(inventoryBySku[product.sku]));
                         bcLookup[product.sku] = { productId: product.id, price: product.price, inStock };
                     });
                 } catch (err) {
