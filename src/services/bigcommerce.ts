@@ -2,6 +2,7 @@ import axios, { AxiosError } from 'axios';
 import config from '../config';
 import logger from '../config/logger';
 
+/** Pre-configured Axios instance for BigCommerce REST Management API calls. Attaches X-Auth-Token and base URL from config; logs and re-throws all non-2xx responses. */
 const bcClient = axios.create({
     baseURL: config.bc.apiBaseUrl,
     headers: {

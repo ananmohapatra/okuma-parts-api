@@ -13,6 +13,7 @@ const router = Router();
 // Types
 // ---------------------------------------------------------------------------
 
+/** A single sheet entry within a TOC assembly, pointing to the parts JSON and diagram images. */
 interface TocSheet {
     id?: string;
     slug: string;
@@ -23,6 +24,7 @@ interface TocSheet {
     parts_json: string;
 }
 
+/** An assembly (or subassembly) node within a TOC document, containing sheets and optional child assemblies. */
 interface TocAssembly {
     slug: string;
     label?: string;
@@ -32,6 +34,7 @@ interface TocAssembly {
     subassemblies?: TocAssembly[];
 }
 
+/** A top-level document entry in the parts book table of contents. */
 interface TocDocument {
     id: string;
     label?: string;
@@ -40,10 +43,12 @@ interface TocDocument {
     assemblies: TocAssembly[];
 }
 
+/** Root structure of the parts book table of contents JSON file. */
 interface Toc {
     documents: TocDocument[];
 }
 
+/** A raw part record as stored in a sheet's parts.json CDN file. */
 interface RawPart {
     box_id?: string;
     callout_number?: unknown;
@@ -60,16 +65,19 @@ interface RawPart {
     matching_table_row_count?: number;
 }
 
+/** Root structure of a sheet's parts data JSON file. */
 interface PartsData {
     parts: RawPart[];
 }
 
+/** Enriched BigCommerce product lookup result for a single SKU. */
 interface BcLookupEntry {
     productId: number | null;
     price: number | null;
     inStock: boolean;
 }
 
+/** A BC product record subset returned by GET /v3/catalog/products. */
 interface BcProduct {
     id: number;
     sku: string;
@@ -82,6 +90,12 @@ interface BcProduct {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Fetch and parse a JSON file from the Parts Book CDN by its relative path.
+ * Returns null on 404 or network failure; logs non-404 errors.
+ * @param relativePath - Path relative to the CDN base URL (e.g. "toc.json").
+ * @returns Parsed JSON as type T, or null if unavailable.
+ */
 async function fetchDataJson<T>(relativePath: string): Promise<T | null> {
     const cdnBase = config.partsBook.cdnBaseUrl;
     const url = `${cdnBase}/${relativePath}`;
@@ -97,6 +111,13 @@ async function fetchDataJson<T>(relativePath: string): Promise<T | null> {
     }
 }
 
+/**
+ * Recursively rewrite all image path fields in a TocAssembly (and its subassemblies)
+ * by applying the given rewrite function to each relative path.
+ * @param assembly - The assembly node to rewrite.
+ * @param rewrite - Function that converts a relative image path to an absolute CDN URL.
+ * @returns A new TocAssembly with all image paths rewritten.
+ */
 function rewriteAssembly(assembly: TocAssembly, rewrite: (p: string) => string): TocAssembly {
     const sheets = assembly.sheets.map(sheet => ({
         ...sheet,
@@ -114,6 +135,12 @@ function rewriteAssembly(assembly: TocAssembly, rewrite: (p: string) => string):
     };
 }
 
+/**
+ * Rewrite all relative image paths in a Toc to absolute CDN URLs.
+ * Processes documents, assemblies (recursively), and sheets.
+ * @param toc - The raw Toc object with relative image paths.
+ * @returns A new Toc with all image paths prefixed by the CDN base URL.
+ */
 function rewriteTocImagePaths(toc: Toc): Toc {
     const cdnBase = config.partsBook.cdnBaseUrl;
     const rewrite = (relPath: string) => `${cdnBase}/${relPath}`;
@@ -130,6 +157,13 @@ function rewriteTocImagePaths(toc: Toc): Toc {
     return { ...toc, documents };
 }
 
+/**
+ * Recursively search an array of TocAssembly nodes for one matching the given slug.
+ * Searches depth-first through subassemblies.
+ * @param assemblies - The array of assemblies to search.
+ * @param slug - The assembly slug to find.
+ * @returns The matching TocAssembly, or null if not found.
+ */
 function findAssemblyBySlug(assemblies: TocAssembly[], slug: string): TocAssembly | null {
     return assemblies.reduce<TocAssembly | null>((found, asm) => {
         if (found) return found;
@@ -138,6 +172,12 @@ function findAssemblyBySlug(assemblies: TocAssembly[], slug: string): TocAssembl
     }, null);
 }
 
+/**
+ * Convert a 4-element bounding box array [ymin, xmin, ymax, xmax] (in 1000ths of image size)
+ * to a percentage-based centre point suitable for callout overlay positioning.
+ * @param box - The bounding box as [ymin, xmin, ymax, xmax].
+ * @returns Object with calloutX and calloutY as percentage values, or null if the box is invalid.
+ */
 function boxToPercent(box: number[]): { calloutX: number; calloutY: number } | null {
     if (!Array.isArray(box) || box.length !== 4 || box.some(v => typeof v !== 'number' || Number.isNaN(v))) {
         return null;
@@ -152,6 +192,12 @@ function boxToPercent(box: number[]): { calloutX: number; calloutY: number } | n
 // Routes
 // ---------------------------------------------------------------------------
 
+/**
+ * GET /v1/api/parts-book/toc
+ *
+ * Returns the full parts book table of contents with all image paths rewritten to
+ * absolute CDN URLs. Fetches toc.json from the configured CDN base URL.
+ */
 router.get('/parts-book/toc', async (_req: Request, res: Response, next: NextFunction) => {
     try {
         const toc = await fetchDataJson<Toc>('toc.json');
@@ -166,7 +212,14 @@ router.get('/parts-book/toc', async (_req: Request, res: Response, next: NextFun
     }
 });
 
-// GET /v1/api/parts-book/toc/:pdfId — single document
+/**
+ * GET /v1/api/parts-book/toc/:pdfId
+ *
+ * Returns a single TOC document by its ID, with image paths rewritten to absolute CDN URLs.
+ * Returns 404 when the document ID is not found in toc.json.
+ *
+ * @param pdfId - The document ID to look up (matches TocDocument.id).
+ */
 router.get('/parts-book/toc/:pdfId', async (req: Request, res: Response, next: NextFunction) => {
     try {
         const { pdfId } = req.params;
@@ -188,6 +241,17 @@ router.get('/parts-book/toc/:pdfId', async (req: Request, res: Response, next: N
     }
 });
 
+/**
+ * GET /v1/api/parts-book/sheets/:pdfId/:assemblySlug/:sheetSlug/parts
+ *
+ * Returns the enriched parts list for a specific sheet within a document/assembly.
+ * Each part is enriched with its BigCommerce product ID, price, and stock status
+ * (where a matching SKU exists), plus callout and table-row overlay coordinates.
+ *
+ * @param pdfId        - The document ID (matches TocDocument.id).
+ * @param assemblySlug - The assembly slug to navigate to.
+ * @param sheetSlug    - The sheet slug within the assembly.
+ */
 router.get(
     '/parts-book/sheets/:pdfId/:assemblySlug/:sheetSlug/parts',
     async (req: Request, res: Response, next: NextFunction) => {
@@ -302,11 +366,13 @@ router.get(
 // Machines
 // ---------------------------------------------------------------------------
 
+/** A publication number entry on a B2B machine record, with an optional publication date. */
 interface PublicationNo {
     pubNo: string;
     pubDate: string | null;
 }
 
+/** A machine record as stored in the B2B company "Machines" extra field JSON array. */
 interface B2BMachine {
     modelNo?: string;
     serialNo?: string;
@@ -316,6 +382,20 @@ interface B2BMachine {
     imageName?: string;
 }
 
+/**
+ * GET /v1/api/customer/:customerId/machines
+ *
+ * Returns a paginated list of registered machines for the given BC customer.
+ * Resolves the customer's B2B company via their email, then reads the "Machines"
+ * extra field JSON from the company record. Inactive machines and duplicate serial
+ * numbers are filtered out.
+ *
+ * Query params:
+ *   page  - Page number (default 1, minimum 1).
+ *   limit - Results per page (default 10, maximum 100).
+ *
+ * Response: { count, pagination: { page, limit, totalPages }, machines: [...] }
+ */
 router.get('/customer/:customerId/machines', async (req: Request, res: Response, next: NextFunction) => {
     const customerId = req.params.customerId as string;
 
@@ -410,6 +490,15 @@ router.get('/customer/:customerId/machines', async (req: Request, res: Response,
     }
 });
 
+/**
+ * GET /v1/api/parts-book/machine/verify?serialNo=<serial>
+ *
+ * Stub endpoint that verifies a machine serial number exists in the system.
+ * Currently returns a hardcoded response for all valid serial numbers.
+ *
+ * Query params:
+ *   serialNo - The machine serial number to verify (required).
+ */
 router.get('/parts-book/machine/verify', (req: Request, res: Response, next: NextFunction) => {
     const { serialNo } = req.query;
 

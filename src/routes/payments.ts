@@ -6,26 +6,42 @@ import bcClient from '../services/bigcommerce';
 
 const router = Router();
 
+/**
+ * Returns the BlueSnap REST API base URL for the configured environment.
+ * @returns "https://ws.bluesnap.com" for production, sandbox URL otherwise.
+ */
 function bluesnapBase(): string {
     return config.bluesnap.env === 'production' ? 'https://ws.bluesnap.com' : 'https://sandbox.bluesnap.com';
 }
 
+/**
+ * Builds an HTTP Basic Authorization header value from the configured BlueSnap credentials.
+ * @returns Base64-encoded "Basic <credentials>" header string.
+ */
 function bluesnapAuthHeader(): string {
     const credentials = Buffer.from(`${config.bluesnap.apiUsername}:${config.bluesnap.apiPassword}`).toString('base64');
     return `Basic ${credentials}`;
 }
 
+/** A single error entry from a BlueSnap array-style error response body. */
 interface BluesnapErrorEntry {
     errorName?: string;
     code?: string;
     description?: string;
 }
 
+/** Shape of a BlueSnap API error response body. */
 interface BluesnapErrorBody {
     message?: BluesnapErrorEntry[] | string;
     description?: string;
 }
 
+/**
+ * Extracts a human-readable error message from a BlueSnap API error response.
+ * Handles both the array-of-entries format and plain string message formats.
+ * @param err - The caught error, typically an AxiosError from a BlueSnap call.
+ * @returns A user-facing error description string.
+ */
 function bluesnapErrorMessage(err: unknown): string {
     const axErr = err as AxiosError<BluesnapErrorBody>;
     const data = axErr.response?.data;
@@ -38,6 +54,11 @@ function bluesnapErrorMessage(err: unknown): string {
     return (err as Error).message ?? 'BlueSnap error';
 }
 
+/**
+ * Extracts a structured debug detail object from a BlueSnap API error for use in log entries.
+ * @param err - The caught error from a BlueSnap call.
+ * @returns An object containing the BlueSnap HTTP status code.
+ */
 function bluesnapDebugDetail(err: unknown): object {
     const axErr = err as AxiosError<BluesnapErrorBody>;
     return {
@@ -91,6 +112,7 @@ router.get('/bluesnap/hpf-token', async (_req: Request, res: Response) => {
     }
 });
 
+/** Expected request body shape for POST /payments/bluesnap/charge. */
 interface ChargeBody {
     pfToken?: unknown;
     amount?: unknown;
@@ -172,6 +194,7 @@ router.post('/bluesnap/charge', async (req: Request, res: Response) => {
     }
 });
 
+/** Billing address fields accepted within the POST /payments/bc/token request body. */
 interface BillingAddressBody {
     street1?: unknown;
     street2?: unknown;
@@ -182,6 +205,7 @@ interface BillingAddressBody {
     countryIso2?: unknown;
 }
 
+/** Expected request body shape for POST /payments/bc/token. */
 interface BcTokenBody {
     amount?: unknown;
     currency?: unknown;
@@ -192,6 +216,7 @@ interface BcTokenBody {
     orderDescription?: unknown;
 }
 
+/** Shape of a payment method entry returned by BC GET /v3/payments/methods. */
 interface BcPaymentMethod {
     id: string;
     supported_instruments: Array<{ type: string }>;

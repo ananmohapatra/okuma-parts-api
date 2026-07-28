@@ -19,14 +19,18 @@ import logger from '../config/logger';
 
 const router = Router();
 
+/** Cache TTL for the BC customer group map, in milliseconds. */
 const GROUP_CACHE_TTL = 5 * 60 * 1000; // 5 minutes — groups change rarely
+/** Maximum number of BC customer IDs that can be passed in a single id:in filter call. */
 const BC_CUSTOMER_FILTER_LIMIT = 250;
+/** Maximum number of recent customer search entries stored per dealer. */
 const RECENT_SEARCH_LIMIT = 3;
 
 // ---------------------------------------------------------------------------
 // Types — BC
 // ---------------------------------------------------------------------------
 
+/** A registered machine on a customer account. */
 interface Machine {
     serial: string | null;
     model: string | null;
@@ -38,6 +42,7 @@ interface Machine {
 // Types — B2B Machines extra field
 // ---------------------------------------------------------------------------
 
+/** Raw machine entry as stored in the B2B company "Machines" extra field JSON array. */
 interface B2BMachineRecord {
     modelNo?: string;
     serialNo?: string;
@@ -45,6 +50,7 @@ interface B2BMachineRecord {
     status?: string;
 }
 
+/** A BigCommerce customer record subset returned by GET /v3/customers. */
 interface BcCustomer {
     id: number;
     email: string;
@@ -56,6 +62,7 @@ interface BcCustomer {
     date_modified: string | null;
 }
 
+/** A recent customer search entry stored in the dealer's B2B company extra field. */
 interface RecentCustomerSearch {
     customerId: number;
     customerName: string;
@@ -63,6 +70,7 @@ interface RecentCustomerSearch {
     searchedAt: string; // ISO 8601
 }
 
+/** A BigCommerce customer group record returned by GET /v2/customer_groups. */
 interface BcCustomerGroup {
     id: number;
     name: string;
@@ -72,6 +80,7 @@ interface BcCustomerGroup {
 // Types — B2B Edition hierarchy
 // ---------------------------------------------------------------------------
 
+/** Result of resolving a dealer's B2B hierarchy: customer IDs and their registered machines. */
 interface DealerCustomerResult {
     customerIds: number[];
     totalCustomerIds: number;
@@ -83,18 +92,22 @@ interface DealerCustomerResult {
 // BC Helpers
 // ---------------------------------------------------------------------------
 
+/** In-memory cache of BC customer group id → name. Null when not yet loaded. */
 let groupCache: Record<number, string> | null = null;
+/** Unix timestamp (ms since epoch) of the last successful groupCache population. */
 let groupCacheAt = 0;
 
 // ---------------------------------------------------------------------------
 // Types — Dealer Address Review
 // ---------------------------------------------------------------------------
 
+/** A single name/value extra field entry on a B2B address record. */
 interface B2BAddressExtraFieldEntry {
     fieldName: string;
     fieldValue: string;
 }
 
+/** Full B2B address record as returned by GET /api/v3/io/addresses/{id}. */
 interface B2BAddressItem {
     addressId: number;
     firstName: string;
@@ -119,16 +132,21 @@ interface B2BAddressItem {
     extraFields?: B2BAddressExtraFieldEntry[];
 }
 
+/** Paginated response envelope from GET /api/v3/io/addresses. */
 interface B2BAddressListResponse {
     data: B2BAddressItem[];
 }
 
+/** Single address detail response from GET /api/v3/io/addresses/{id}. */
 interface B2BAddressDetailResponse {
     data: B2BAddressItem;
 }
 
+/** Permitted approval status values for the dealer address review workflow. */
 type DealerAddressApprovalStatus = 'pending' | 'approved' | 'rejected';
+/** B2B address extra field name that holds the dealer address approval status. */
 const DEALER_APPROVAL_FIELD = 'Approval Status';
+/** B2B address extra field name that holds rejection remarks for a declined address. */
 const DEALER_REJECTION_REMARKS_FIELD = 'Rejection Remarks';
 
 /**
@@ -212,6 +230,11 @@ async function batchedMap<T, R>(items: T[], fn: (item: T) => Promise<R>, concurr
     return results;
 }
 
+/**
+ * Build a minimal dealer summary object from a BC customer record.
+ * @param dealer - The raw BC customer record.
+ * @returns Dealer summary with id, firstName, lastName, email, and company.
+ */
 function buildDealerSummary(dealer: BcCustomer) {
     return {
         id: dealer.id,
@@ -313,6 +336,8 @@ async function fetchCustomerIdsFromHierarchy(dealerEmail: string): Promise<Deale
  * Returns null when the company has no address flagged as default shipping.
  * List endpoint already returns city/stateCode/isDefaultShipping — no per-address
  * detail call is needed here (that's only required for extraFields, e.g. approval status).
+ * @param companyId - B2B company ID.
+ * @returns The default shipping address's city/stateCode, or null if none is set.
  */
 async function fetchCompanyDefaultShippingAddress(
     companyId: number
@@ -333,7 +358,11 @@ async function fetchCompanyDefaultShippingAddress(
     return { city: defaultShipping.city, stateCode: defaultShipping.stateCode };
 }
 
-/** Fetch a B2B company's Account Number extra field. Returns null on any lookup failure. */
+/**
+ * Fetch a B2B company's Account Number extra field. Returns null on any lookup failure.
+ * @param companyId - B2B company ID.
+ * @returns The trimmed account number, or null if unset or the lookup fails.
+ */
 async function fetchCompanyAccountNumber(companyId: number): Promise<string | null> {
     const company = await fetchB2BCompanyById(companyId);
     const extraFieldMap = buildCompanyExtraFieldsMap(company?.extraFields);
@@ -712,6 +741,11 @@ router.post('/dealers/:dealerId/recent-customer-search', async (req, res) => {
 // Address Helpers — Dealer Address Review
 // ---------------------------------------------------------------------------
 
+/**
+ * Extract the dealer address approval status from B2B extra fields.
+ * @param extraFields - The address's extra fields array.
+ * @returns The parsed status, or null if absent or unrecognised.
+ */
 function getDealerAddressApprovalStatus(extraFields?: B2BAddressExtraFieldEntry[]): DealerAddressApprovalStatus | null {
     const field = (extraFields ?? []).find(
         f => f.fieldName.trim().toLowerCase() === DEALER_APPROVAL_FIELD.toLowerCase()
@@ -723,6 +757,11 @@ function getDealerAddressApprovalStatus(extraFields?: B2BAddressExtraFieldEntry[
     return null;
 }
 
+/**
+ * Extract the rejection remarks text from B2B address extra fields.
+ * @param extraFields - The address's extra fields array.
+ * @returns The rejection remarks value, or null if the field is absent.
+ */
 function getDealerRejectionRemarks(extraFields?: B2BAddressExtraFieldEntry[]): string | null {
     const field = (extraFields ?? []).find(
         f => f.fieldName.trim().toLowerCase() === DEALER_REJECTION_REMARKS_FIELD.toLowerCase()
@@ -730,7 +769,12 @@ function getDealerRejectionRemarks(extraFields?: B2BAddressExtraFieldEntry[]): s
     return field?.fieldValue ?? null;
 }
 
-// List endpoint omits extraFields — a detail call per address is required to read Approval Status.
+/**
+ * Fetch a single B2B address record by ID, including its extra fields.
+ * List endpoint omits extraFields — a detail call per address is required to read Approval Status.
+ * @param addressId - The B2B address ID to fetch.
+ * @returns The full address record, or null on any error.
+ */
 async function fetchB2BAddressDetail(addressId: number): Promise<B2BAddressItem | null> {
     try {
         const res = await b2bClient.get<B2BAddressDetailResponse>(`/api/v3/io/addresses/${addressId}`);
@@ -740,6 +784,12 @@ async function fetchB2BAddressDetail(addressId: number): Promise<B2BAddressItem 
     }
 }
 
+/**
+ * Fetch all B2B addresses for a company and enrich each with its full detail (including extra fields).
+ * Uses paginated list + batched per-address detail calls.
+ * @param companyId - The B2B company ID.
+ * @returns All addresses with extra fields populated.
+ */
 async function fetchAllCompanyAddressesWithDetail(companyId: number): Promise<B2BAddressItem[]> {
     const list = await collectPages(async off => {
         try {
@@ -757,6 +807,12 @@ async function fetchAllCompanyAddressesWithDetail(companyId: number): Promise<B2
     return batchedMap(list, a => fetchB2BAddressDetail(a.addressId).then(full => full ?? a), 10);
 }
 
+/**
+ * Map a raw B2B address item to the dealer-facing address response shape.
+ * @param a - The raw B2B address record.
+ * @param companyName - The company name to embed in the response.
+ * @returns Normalised dealer address object with approval status and rejection remarks.
+ */
 function mapDealerAddress(a: B2BAddressItem, companyName: string) {
     return {
         addressId: a.addressId,
@@ -785,6 +841,25 @@ function mapDealerAddress(a: B2BAddressItem, companyName: string) {
     };
 }
 
+/**
+ * GET /v1/api/dealers/:dealerId/addresses
+ *
+ * Returns paginated B2B addresses for all customer companies under the dealer's group,
+ * optionally filtered by approval status. Each address is enriched with its extra fields
+ * (approval status, rejection remarks) via per-address detail calls.
+ *
+ * Query params:
+ *   limit          - Number of results per page (1–100, default 20).
+ *   page           - Page number (default 1).
+ *   approvalStatus - Filter to "pending" | "approved" | "rejected" (optional).
+ *
+ * Response:
+ * {
+ *   dealerId:   number,
+ *   pagination: { total, perPage, currentPage, totalPages, offset },
+ *   data:       [{ addressId, companyId, companyName, approvalStatus, rejectionRemarks, ... }]
+ * }
+ */
 router.get('/dealers/:dealerId/addresses', async (req, res) => {
     const { dealerId } = req.params;
 

@@ -5,6 +5,15 @@ import logger from '../config/logger';
 
 const router = Router();
 
+/**
+ * GET /callback
+ *
+ * BigCommerce app OAuth install callback. Exchanges the authorization `code` for
+ * an access token via BC's OAuth token endpoint, completing the app install flow.
+ *
+ * Query: code, scope, context (all supplied by BigCommerce on install/redirect).
+ * Response: { installed: true, context }
+ */
 router.get('/callback', async (req, res, next) => {
     const { code, scope, context } = req.query;
 

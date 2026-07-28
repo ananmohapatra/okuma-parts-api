@@ -7,6 +7,7 @@ import logger from '../config/logger';
 // Types
 // ---------------------------------------------------------------------------
 
+/** A B2B company record as returned by GET /api/v3/io/companies/:id. */
 export interface B2BCompanyRecord {
     companyId: number;
     companyName: string;

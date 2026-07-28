@@ -6,6 +6,7 @@ import logger from '../config/logger';
 // Types
 // ---------------------------------------------------------------------------
 
+/** A key-value extra field attached to a B2B user or company record. */
 export interface B2BUserExtraField {
     fieldName: string;
     fieldValue: string;

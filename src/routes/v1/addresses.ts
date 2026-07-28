@@ -8,20 +8,25 @@ import logger from '../../config/logger';
 const router = Router();
 
 // Pre-configured B2B address extra field names for the approval workflow
+/** B2B address extra field name that holds the approval status. */
 const APPROVAL_STATUS_FIELD = 'Approval Status';
+/** B2B address extra field name that holds rejection remarks for a declined address. */
 const REJECTION_REMARKS_FIELD = 'Rejection Remarks';
+/** Permitted approval status values for the address review workflow. */
 type ApprovalStatus = 'pending' | 'approved' | 'rejected';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
+/** A single name/value extra field entry on a B2B address, optionally typed. */
 interface B2BAddressExtraField {
     fieldName: string;
     fieldValue: string;
     fieldType?: number;
 }
 
+/** Full B2B address record as returned by GET /api/v3/io/addresses/{id}. */
 interface B2BAddress {
     addressId: number;
     firstName: string;
@@ -47,6 +52,7 @@ interface B2BAddress {
     extraFields?: B2BAddressExtraField[];
 }
 
+/** Paginated response envelope from GET /api/v3/io/addresses. */
 interface B2BAddressesResponse {
     code: number;
     data: B2BAddress[];
@@ -56,11 +62,13 @@ interface B2BAddressesResponse {
     };
 }
 
+/** Single address detail response from GET /api/v3/io/addresses/{id}. */
 interface B2BSingleAddressResponse {
     code: number;
     data: B2BAddress;
 }
 
+/** Request body shape for creating a new B2B address. */
 interface CreateAddressBody {
     firstName: string;
     lastName: string;
@@ -80,12 +88,18 @@ interface CreateAddressBody {
     extraFields?: B2BAddressExtraField[];
 }
 
+/** Maximum number of address detail fetches processed concurrently. */
 const BATCH_CONCURRENCY = 10;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Extract the approval status from B2B address extra fields.
+ * @param extraFields - The address's extra fields array.
+ * @returns The recognised ApprovalStatus value, or null if absent or unrecognised.
+ */
 function getApprovalStatus(extraFields?: B2BAddressExtraField[]): ApprovalStatus | null {
     const field = (extraFields ?? []).find(f => f.fieldName === APPROVAL_STATUS_FIELD);
     if (!field) return null;
@@ -94,6 +108,11 @@ function getApprovalStatus(extraFields?: B2BAddressExtraField[]): ApprovalStatus
     return null;
 }
 
+/**
+ * Extract the rejection remarks text from B2B address extra fields.
+ * @param extraFields - The address's extra fields array.
+ * @returns The rejection remarks string, or null if the field is absent.
+ */
 function getRejectionRemarks(extraFields?: B2BAddressExtraField[]): string | null {
     const field = (extraFields ?? []).find(
         f => f.fieldName.trim().toLowerCase() === REJECTION_REMARKS_FIELD.toLowerCase()
@@ -101,6 +120,11 @@ function getRejectionRemarks(extraFields?: B2BAddressExtraField[]): string | nul
     return field?.fieldValue ?? null;
 }
 
+/**
+ * Map a raw B2B address record to the API response shape, including approval metadata.
+ * @param a - The raw B2B address record.
+ * @returns Normalised address object with approvalStatus and rejectionRemarks fields.
+ */
 function mapAddress(a: B2BAddress) {
     return {
         addressId: a.addressId,
@@ -129,6 +153,14 @@ function mapAddress(a: B2BAddress) {
     };
 }
 
+/**
+ * Apply an async mapper to items in batches of BATCH_CONCURRENCY, accumulating results.
+ * @param items - Array of items to process.
+ * @param mapper - Async function to apply to each item.
+ * @param index - Starting index for the current batch (default 0).
+ * @param accumulated - Results accumulated so far (default []).
+ * @returns Promise resolving to the full mapped array.
+ */
 async function mapInBatches<T, U>(
     items: T[],
     mapper: (item: T) => Promise<U>,
@@ -142,6 +174,11 @@ async function mapInBatches<T, U>(
     return mapInBatches(items, mapper, index + BATCH_CONCURRENCY, [...accumulated, ...mapped]);
 }
 
+/**
+ * Fetch a single B2B address record by ID, including its extra fields.
+ * @param addressId - The B2B address ID to fetch (as a string).
+ * @returns The full address record, or null on any error.
+ */
 async function fetchAddressById(addressId: string): Promise<B2BAddress | null> {
     try {
         const res = await b2bClient.get<B2BSingleAddressResponse>(`/api/v3/io/addresses/${addressId}`);
@@ -151,6 +188,13 @@ async function fetchAddressById(addressId: string): Promise<B2BAddress | null> {
     }
 }
 
+/**
+ * Apply an approval status (and optional rejection remarks) to a B2B address.
+ * Approved addresses have isBilling/isShipping enabled; pending/rejected addresses are locked.
+ * @param address - The current B2B address record to update.
+ * @param status - The new approval status to apply.
+ * @param rejectionRemarks - Optional remarks to attach when status is 'rejected'.
+ */
 async function applyApprovalStatus(
     address: B2BAddress,
     status: ApprovalStatus,
@@ -209,8 +253,11 @@ async function resolveDistributorAccountNumber(distributorId: string): Promise<s
 // ---------------------------------------------------------------------------
 
 /**
- * Fetch all B2B customer company IDs whose distributor_id matches the given account number.
+ * Fetch all B2B customer company stubs via paginated GET /api/v3/io/companies.
  * The company list endpoint omits extraFields, so each company is fetched individually for its detail.
+ * @param offset - Pagination offset for the current page.
+ * @param accumulated - Company stubs accumulated from previous pages.
+ * @returns Full flat array of all company stubs across all pages.
  */
 async function fetchCompanyStubs(
     offset: number,
@@ -225,6 +272,11 @@ async function fetchCompanyStubs(
     return page.length < PAGE ? all : fetchCompanyStubs(offset + PAGE, all);
 }
 
+/**
+ * Fetch all B2B company IDs whose distributor_id extra field matches the given account number.
+ * @param accountNumber - The distributor's account number to match against.
+ * @returns Array of companyId values belonging to the distributor's customers.
+ */
 async function fetchDistributorCustomerCompanyIds(accountNumber: string): Promise<number[]> {
     const stubs = await fetchCompanyStubs(0, []);
     const details = await mapInBatches(stubs, stub => fetchB2BCompanyById(stub.companyId));
@@ -238,7 +290,11 @@ async function fetchDistributorCustomerCompanyIds(accountNumber: string): Promis
 }
 
 /**
- * Fetch all addresses for a single company, enriched with extraFields.
+ * Fetch all addresses for a single company via paginated GET /api/v3/io/addresses.
+ * @param companyId - The B2B company ID.
+ * @param offset - Pagination offset for the current page.
+ * @param accumulated - Addresses accumulated from previous pages.
+ * @returns Full flat array of all raw B2B addresses for the company.
  */
 async function fetchAddressPage(companyId: number, offset: number, accumulated: B2BAddress[]): Promise<B2BAddress[]> {
     const PAGE = 250;
@@ -250,15 +306,34 @@ async function fetchAddressPage(companyId: number, offset: number, accumulated: 
     return page.length < PAGE ? all : fetchAddressPage(companyId, offset + PAGE, all);
 }
 
+/**
+ * Fetch all B2B addresses for a company, enriched with extra fields via per-address detail calls.
+ * Uses fetchAddressPage for pagination and mapInBatches for concurrent detail fetches.
+ * @param companyId - The B2B company ID.
+ * @returns Array of fully-populated B2BAddress records (including extraFields).
+ */
 async function fetchAllAddressesForCompany(companyId: number): Promise<B2BAddress[]> {
     const all = await fetchAddressPage(companyId, 0, []);
     return mapInBatches(all, address => fetchAddressById(String(address.addressId)).then(full => full ?? address));
 }
 
-// GET /v1/api/addresses?companyId=13802422&approvalStatus=pending&limit=20&page=1
-// GET /v1/api/addresses?distributorId=326&companyId=13802422&approvalStatus=pending&limit=20&page=1
-// distributorId is optional. When provided, scopes results to the distributor's customers.
-// When omitted, companyId is required and addresses are returned directly for that company.
+/**
+ * GET /v1/api/addresses?companyId=13802422&approvalStatus=pending&limit=20&page=1
+ * GET /v1/api/addresses?distributorId=326&companyId=13802422&approvalStatus=pending&limit=20&page=1
+ *
+ * Returns paginated B2B addresses, optionally filtered by approval status.
+ * When distributorId is provided, scopes results to that distributor's customer companies.
+ * When omitted, companyId is required and addresses are returned directly for that company.
+ *
+ * Query params:
+ *   distributorId  - BC customer ID of the distributor (optional; scopes to their customers when present).
+ *   companyId      - B2B company ID to filter to (required when distributorId is absent).
+ *   approvalStatus - Filter to "pending" | "approved" | "rejected" (optional).
+ *   limit          - Number of results per page (1–250, default 50).
+ *   page           - Page number (default 1).
+ *
+ * Response: { pagination: { total, perPage, currentPage, totalPages, offset }, data: [...] }
+ */
 router.get('/addresses', async (req: Request, res: Response) => {
     try {
         const distributorIdRaw = req.query.distributorId as string | undefined;
@@ -348,10 +423,18 @@ router.get('/addresses', async (req: Request, res: Response) => {
     }
 });
 
-// POST /v1/api/addresses
-// Approval is determined by the company's relationship_type:
-//   distributor company → approved immediately (distributor creating their own address)
-//   customer company    → pending, approval goes to the company's assigned distributor
+/**
+ * POST /v1/api/addresses
+ *
+ * Creates a new B2B address for a company. The initial approval status is determined
+ * by the company's relationship_type extra field:
+ *   - distributor → approved immediately (isBilling/isShipping enabled).
+ *   - customer    → pending (isBilling/isShipping disabled until approved by the distributor).
+ *
+ * Body: { firstName, lastName, companyId, addressLine1, city, stateName, countryName, [zipCode, phoneNumber, label, ...] }
+ *
+ * Response: mapped address object, plus `pendingApprovalBy` (distributor account number) when status is pending.
+ */
 router.post('/addresses', async (req: Request, res: Response) => {
     try {
         const body = req.body as Partial<CreateAddressBody>;
@@ -447,6 +530,13 @@ router.post('/addresses', async (req: Request, res: Response) => {
     }
 });
 
+/**
+ * Authorize an address action for a distributor: verify the address exists, is pending,
+ * and belongs to one of the distributor's customer companies.
+ * @param addressId - The B2B address ID (as a string).
+ * @param distributorAccountNumber - The distributor's account number for ownership validation.
+ * @returns The resolved address on success, or an error + HTTP status code on failure.
+ */
 async function authorizeAddressAction(
     addressId: string,
     distributorAccountNumber: string
@@ -473,21 +563,30 @@ async function authorizeAddressAction(
     return { address };
 }
 
+/** A single item in a bulk address action request body. */
 interface BulkActionItem {
     addressId: unknown;
     action: unknown;
     rejectionRemarks?: unknown;
 }
 
+/** The per-address result of a bulk approve/reject operation. */
 interface BulkActionResult {
     addressId: number;
     approvalStatus?: string;
     error?: string;
 }
 
-// PATCH /v1/api/addresses/:distributorId
-// Distributor bulk-approves or rejects pending address requests for their associated customers.
-// Body: [{ addressId: number, action: "approve" | "reject" }, ...]
+/**
+ * PATCH /v1/api/addresses/:distributorId
+ *
+ * Distributor bulk-approves or rejects pending address requests for their associated customers.
+ * Each item in the request body is processed independently; partial failures are returned inline.
+ *
+ * Body: [{ addressId: number, action: "approve" | "reject", rejectionRemarks?: string }, ...]
+ *
+ * Response: [{ addressId, approvalStatus } | { addressId, error }, ...]
+ */
 router.patch('/addresses/:distributorId', async (req: Request, res: Response) => {
     const { distributorId } = req.params as Record<string, string>;
 

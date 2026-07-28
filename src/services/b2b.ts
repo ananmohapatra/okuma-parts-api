@@ -2,6 +2,7 @@ import axios, { AxiosError } from 'axios';
 import config from '../config';
 import logger from '../config/logger';
 
+/** Pre-configured Axios instance for BigCommerce B2B Edition (BundleB2B) API calls. Attaches X-Auth-Token, X-Store-Hash, and base URL from config; logs and re-throws all non-2xx responses. */
 const b2bClient = axios.create({
     baseURL: config.bc.b2bApiBaseUrl,
     headers: {

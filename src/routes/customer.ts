@@ -26,6 +26,7 @@ const COMPANY_PROFILE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 // Company profile cache
 // ---------------------------------------------------------------------------
 
+/** Profile data for a B2B company used in the companyProfile response and in-memory cache. */
 interface CompanyProfileData {
     companyName: string | null;
     accountNumber: string | null;
@@ -39,6 +40,7 @@ interface CompanyProfileData {
     };
 }
 
+/** In-memory cache entry wrapping CompanyProfileData with a TTL expiry timestamp. */
 interface CompanyProfileCacheEntry {
     data: CompanyProfileData;
     expiresAt: number;
@@ -46,6 +48,11 @@ interface CompanyProfileCacheEntry {
 
 const companyProfileCache = new Map<string, CompanyProfileCacheEntry>();
 
+/**
+ * Reads a company's cached companyProfile data, evicting it if the TTL has expired.
+ * @param companyId - B2B company ID.
+ * @returns The cached profile data, or null if not cached or expired.
+ */
 function getProfileCache(companyId: string): CompanyProfileData | null {
     const entry = companyProfileCache.get(companyId);
     if (!entry) return null;
@@ -56,6 +63,12 @@ function getProfileCache(companyId: string): CompanyProfileData | null {
     return entry.data;
 }
 
+/**
+ * Caches a company's companyProfile data for COMPANY_PROFILE_CACHE_TTL_MS.
+ * @param companyId - B2B company ID.
+ * @param data - Profile data to cache.
+ * @returns Nothing — writes into the in-memory cache.
+ */
 function setProfileCache(companyId: string, data: CompanyProfileData): void {
     companyProfileCache.set(companyId, { data, expiresAt: Date.now() + COMPANY_PROFILE_CACHE_TTL_MS });
 }
@@ -64,6 +77,7 @@ function setProfileCache(companyId: string, data: CompanyProfileData): void {
 // Types
 // ---------------------------------------------------------------------------
 
+/** Normalised machine record shape returned in API responses. */
 interface Machine {
     model: string;
     serial: string;
@@ -75,11 +89,13 @@ interface Machine {
     imageName: string | null;
 }
 
+/** Per-customer machine selection state persisted in the Express session. */
 interface MachineSessionState {
     selected: string | null;
     recent: string[];
 }
 
+/** A single entry in the dealer's recent customer-search history. */
 interface CustomerSearchEntry {
     customerId: number;
     customerName: string;
@@ -91,6 +107,7 @@ interface CustomerSearchEntry {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** Raw machine record shape parsed from the B2B company Machines extra field JSON. */
 interface B2BMachineRecord {
     modelNo?: string;
     serialNo?: string;
@@ -125,6 +142,14 @@ const EMPTY_MACHINES_RESULT: B2BMachinesResult = {
     companyExtraFields: {},
 };
 
+/**
+ * Fetch and normalise the machine list for a customer from the B2B company Machines extra field.
+ * Resolves: BC email → B2B user → companyId → company extraFields → Machines JSON.
+ * Filters out inactive machines and those with missing or duplicate serial numbers.
+ * Returns EMPTY_MACHINES_RESULT on any lookup failure so callers always receive a valid shape.
+ * @param email - BC customer email address.
+ * @returns Machines list plus associated company metadata and extra fields.
+ */
 async function fetchB2BMachines(email: string): Promise<B2BMachinesResult> {
     try {
         const usersRes = await b2bClient.get<{ data: Array<{ companyId?: number }> }>('/api/v3/io/users', {
@@ -367,6 +392,9 @@ router.get('/customer/:customerId/distributor', async (req: Request<{ customerId
     if (!customerId || !/^\d+$/.test(customerId)) {
         return res.status(400).json({ error: 'Invalid customerId.' });
     }
+    if (req.session.customerId !== customerId) {
+        return res.status(403).json({ error: 'Forbidden.' });
+    }
 
     try {
         const profile = await fetchCustomerProfile(customerId);
@@ -408,6 +436,9 @@ router.get('/customer/:customerId/machines', async (req: Request<{ customerId: s
     if (!customerId || !/^\d+$/.test(customerId)) {
         return res.status(400).json({ error: 'Invalid customerId.' });
     }
+    if (req.session.customerId && req.session.customerId !== customerId) {
+        return res.status(403).json({ error: 'Forbidden.' });
+    }
 
     try {
         const profile = await fetchCustomerProfile(customerId);
@@ -444,6 +475,9 @@ router.get('/customer/:customerId/header-context', async (req: Request<{ custome
 
     if (!customerId || !/^\d+$/.test(customerId)) {
         return res.status(400).json({ error: 'Invalid customerId.' });
+    }
+    if (req.session.customerId && req.session.customerId !== customerId) {
+        return res.status(403).json({ error: 'Forbidden.' });
     }
 
     try {
@@ -533,6 +567,9 @@ router.post('/customer/:customerId/machine/select', async (req: Request<{ custom
     if (!customerId || !/^\d+$/.test(customerId)) {
         return res.status(400).json({ error: 'Invalid customerId.' });
     }
+    if (req.session.customerId && req.session.customerId !== customerId) {
+        return res.status(403).json({ error: 'Forbidden.' });
+    }
     if (!serial || typeof serial !== 'string' || !serial.trim()) {
         return res.status(400).json({ error: 'serial is required.' });
     }
@@ -600,6 +637,9 @@ router.get('/customer/:customerId/searches', async (req: Request<{ customerId: s
 
     if (!customerId || !/^\d+$/.test(customerId)) {
         return res.status(400).json({ error: 'Invalid customerId.' });
+    }
+    if (req.session.customerId && req.session.customerId !== customerId) {
+        return res.status(403).json({ error: 'Forbidden.' });
     }
 
     try {
@@ -702,6 +742,9 @@ router.get('/customer/:customerId/metafields', async (req: Request<{ customerId:
     if (!customerId || !/^\d+$/.test(customerId)) {
         return res.status(400).json({ error: 'Invalid customerId.' });
     }
+    if (req.session.customerId && req.session.customerId !== customerId) {
+        return res.status(403).json({ error: 'Forbidden.' });
+    }
     if (!key || !key.trim()) {
         return res.status(400).json({ error: 'key query param is required.' });
     }
@@ -723,7 +766,7 @@ router.get('/customer/:customerId/metafields', async (req: Request<{ customerId:
     }
 });
 
-/*
+/**
  * GET /customer/companyProfile?companyId={companyId}
  *
  * Returns company name, account number, and default shipping address.
@@ -734,7 +777,8 @@ router.get('/customer/:customerId/metafields', async (req: Request<{ customerId:
  *
  * Calls A and B run in parallel. Result cached by companyId for 5 minutes.
  *
- * Response: { companyName, accountNumber, address }
+ * Query: companyId - B2B company ID (required, numeric).
+ * Response: { companyName, accountNumber, address: { line1, city, state, zipCode, country, formatted } }
  */
 router.get('/customer/companyProfile', authenticateBCToken, async (req: Request, res: Response) => {
     const companyId = req.query.companyId as string | undefined;
@@ -821,6 +865,8 @@ router.get('/customer/companyProfile', authenticateBCToken, async (req: Request,
  * The caller must supply the B2B storefront token (obtained from
  * GET /v1/customer/:customerId/b2b-token) as `Authorization: Bearer <token>`.
  *
+ * Params: companyId - B2B company ID (route param).
+ * Headers: Authorization - `Bearer <b2b-storefront-token>` (required, forwarded to B2B).
  * Response: the raw JSON from https://api-b2b.bigcommerce.com/api/v2/companies/{companyId}/default-addresses
  */
 router.get(
@@ -866,13 +912,24 @@ router.get(
     }
 );
 
-// GET /v1/customer/:customerId/b2b-token
-// Returns a B2B storefront customer token for use with the B2B Storefront GraphQL API.
+/**
+ * GET /customer/:customerId/b2b-token
+ *
+ * Returns a B2B storefront customer token for use with the B2B Storefront GraphQL API.
+ * The token is passed by the Stencil theme to authorise customer-scoped B2B queries
+ * and is used as the Bearer token for the default-addresses proxy route.
+ *
+ * Params: customerId — BC customer ID (numeric string).
+ * Response: { token: string }
+ */
 router.get('/customer/:customerId/b2b-token', async (req: Request<{ customerId: string }>, res: Response) => {
     const { customerId } = req.params;
 
     if (!customerId || !/^\d+$/.test(customerId)) {
         return res.status(400).json({ error: 'Invalid customerId.' });
+    }
+    if (req.session.customerId && req.session.customerId !== customerId) {
+        return res.status(403).json({ error: 'Forbidden.' });
     }
 
     try {

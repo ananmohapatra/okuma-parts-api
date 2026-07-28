@@ -1,4 +1,3 @@
-
 import path from 'path';
 import dotenv from 'dotenv';
 
@@ -61,7 +60,7 @@ const config: AppConfig = {
     bluesnap: {
         apiUsername: process.env.BLUESNAP_API_USERNAME,
         apiPassword: process.env.BLUESNAP_API_PASSWORD,
-        env:         process.env.BLUESNAP_ENV ?? 'sandbox',
+        env: (process.env.BLUESNAP_ENV ?? 'sandbox').toLowerCase(),
     },
     partsBook: {
         cdnBaseUrl: process.env.PARTS_BOOK_CDN_BASE_URL,
@@ -79,6 +78,3 @@ if (missing.length) {
 }
 
 export default config;
-
-
-

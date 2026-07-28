@@ -11,6 +11,7 @@ const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100;
 const CURRENCY_CODE = 'USD';
 
+/** Shape of a product entry returned by BC GET /v3/catalog/products keyword search. */
 interface BcSearchProduct {
     id: number;
     sku: string;
@@ -21,6 +22,7 @@ interface BcSearchProduct {
     inventory_level: number;
 }
 
+/** Shape of a single pricing item returned by BC POST /v3/pricing/products. */
 interface BcPricingItem {
     product_id: number;
     price: { as_entered: number };
@@ -28,11 +30,13 @@ interface BcPricingItem {
     sale_price: { as_entered: number } | null;
 }
 
+/** Normalised per-product pricing output produced by fetchPricing. */
 interface PricingResult {
     unitPrice: number | null;
     originalPrice: number | null;
 }
 
+/** Normalised part result shape returned in each element of the search response array. */
 interface PartResult {
     productId: number;
     partNumber: string;
@@ -53,6 +57,9 @@ interface PartResult {
  * customer_group_id is omitted from the payload (not from BC's required fields —
  * only channel_id + currency_code are mandatory) when the customer has none,
  * so pricing still resolves to base price instead of failing outright.
+ * @param productIds - BC product IDs to price.
+ * @param customerGroupId - Dealer's BC customer group ID for group-specific pricing, or null to use base pricing.
+ * @returns Map of product ID to `{ unitPrice, originalPrice }` (originalPrice is null when no discount applies).
  */
 async function fetchPricing(
     productIds: number[],

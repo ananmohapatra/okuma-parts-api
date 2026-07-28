@@ -3,6 +3,7 @@ import b2bClient from './b2b';
 import fetchCustomerProfile from './customerProfile';
 import logger from '../config/logger';
 
+/** A single inventory location entry as returned by the BC /v3/inventory/items endpoint. */
 export interface BcInventoryLocation {
     location_id: number;
     location_code: string;
@@ -11,13 +12,16 @@ export interface BcInventoryLocation {
     location_enabled: boolean;
 }
 
+/** A single inventory item (SKU + product ID) with per-location stock levels. */
 export interface BcInventoryItem {
     identity: { sku: string; product_id: number };
     locations: BcInventoryLocation[];
 }
 
+/** Identifies which location is fulfilling a stock check: dealer warehouse, Okuma warehouse, or none (backorder). */
 export type StockSource = 'dealer' | 'okuma' | 'none';
 
+/** Resolved stock availability result for a single SKU, including source and shipping message. */
 export interface StockResult {
     inStock: boolean;
     stockSource: StockSource;
@@ -25,6 +29,12 @@ export interface StockResult {
     shippingDetails: string;
 }
 
+/**
+ * Normalise a location or company name for fuzzy matching by lowercasing and
+ * stripping all non-alphanumeric characters.
+ * @param name - The raw name string to normalise.
+ * @returns The normalised string (lowercase, alphanumeric only).
+ */
 export function normalizeForMatch(name: string): string {
     return name.toLowerCase().replace(/[^a-z0-9]/g, '');
 }
@@ -110,6 +120,7 @@ export function hasAnyStock(invItem: BcInventoryItem | undefined): boolean {
 // Dealer location resolution
 // ---------------------------------------------------------------------------
 
+/** Slim inventory location record used for dealer-location resolution. */
 interface BcLocationEntry {
     id: number;
     code: string;
@@ -117,12 +128,21 @@ interface BcLocationEntry {
     enabled: boolean;
 }
 
+/** TTL for the cached BC inventory locations list (30 minutes — location codes rarely change). */
 const LOCATION_LIST_CACHE_TTL_MS = 30 * 60 * 1000; // 30 min — location codes rarely change
+/** TTL for the per-customer dealer location ID cache (5 minutes). */
 const DEALER_LOC_CACHE_TTL_MS = 5 * 60 * 1000;
 
+/** In-memory cache for the full BC inventory locations list. */
 let locationListCache: { data: BcLocationEntry[]; expiresAt: number } | null = null;
+/** In-memory per-customer cache mapping customer IDs to their resolved dealer location IDs. */
 const dealerLocCache = new Map<string, { locationId: number | null; expiresAt: number }>();
 
+/**
+ * Fetch all enabled BC inventory locations, using an in-memory cache to avoid
+ * repeated API calls within the TTL window.
+ * @returns The full list of BC inventory location entries.
+ */
 async function fetchAllLocations(): Promise<BcLocationEntry[]> {
     if (locationListCache && Date.now() < locationListCache.expiresAt) return locationListCache.data;
     const res = await bcClient.get<{ data: BcLocationEntry[] }>('/v3/inventory/locations');
@@ -153,9 +173,9 @@ export async function resolveDealerLocationId(customerId: string): Promise<numbe
 
     const cache = (locationId: number | null): number | null => {
         const now = Date.now();
-        for (const [key, entry] of dealerLocCache) {
+        Array.from(dealerLocCache.entries()).forEach(([key, entry]) => {
             if (now >= entry.expiresAt) dealerLocCache.delete(key);
-        }
+        });
         dealerLocCache.set(customerId, { locationId, expiresAt: now + DEALER_LOC_CACHE_TTL_MS });
         return locationId;
     };

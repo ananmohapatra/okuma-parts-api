@@ -15,6 +15,7 @@ import logger from '../config/logger';
 
 const router = Router();
 
+/** Maps BC order status_id values to their human-readable status labels. */
 const STATUS_MAP: Record<number, string> = {
     1: 'Pending',
     2: 'Shipped',
@@ -32,13 +33,19 @@ const STATUS_MAP: Record<number, string> = {
     14: 'Partially Refunded',
 };
 
+/** TTL in hours for the dealer_customer_ids B2B user extra field cache. */
 const CACHE_TTL_HOURS = 24;
+/** B2B order extra field name recording which company the order was placed for. */
 const ORDER_EXTRA_FIELD_ORDERED_FOR = 'orderedFor';
+/** B2B order extra field name recording which dealer company placed the order. */
 const ORDER_EXTRA_FIELD_CREATED_BY = 'createdBy';
+/** Default BC order status label applied when the caller omits the status field. */
 const DEFAULT_PLACE_ORDER_STATUS = 'Pending';
+/** Cache TTL for dealer hierarchy resolution, in milliseconds (5 minutes). */
 const HIERARCHY_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes — mirrors dealers.ts's group cache pattern
 
 // BigCommerce OOTB status label -> BC status_id, for orders placed via POST /orders (no payment collected — NET-terms/PO)
+/** Maps BigCommerce OOTB order status labels to their corresponding status_id values. */
 const ORDER_STATUS_ID_BY_LABEL: Record<string, number> = {
     Pending: 1,
     'Awaiting Fulfillment': 11,
@@ -47,6 +54,14 @@ const ORDER_STATUS_ID_BY_LABEL: Record<string, number> = {
     Cancelled: 5,
 };
 
+/**
+ * Run an async fn over items with at most `concurrency` in-flight at once.
+ * Mirrors the batchedMap pattern in routes/dealers.ts.
+ * @param items - Array of items to process.
+ * @param fn - Async function to apply to each item.
+ * @param concurrency - Maximum number of concurrent in-flight promises.
+ * @returns Promise resolving to an array of results in the same order as items.
+ */
 // Fix #4: concurrency-limited map — mirrors the batchedMap pattern in routes/dealers.ts
 async function batchedMap<T, R>(items: T[], fn: (item: T) => Promise<R>, concurrency: number): Promise<R[]> {
     const results: R[] = new Array(items.length);
@@ -64,16 +79,19 @@ async function batchedMap<T, R>(items: T[], fn: (item: T) => Promise<R>, concurr
     return results;
 }
 
+/** Cached dealer customer ID list stored as a B2B user extra field. */
 interface CustomerIdCache {
     ids: number[];
     cachedAt: string;
 }
 
+/** A BigCommerce customer group record returned by GET /v2/customer_groups. */
 interface BcCustomerGroup {
     id: number;
     name: string;
 }
 
+/** Minimal BC customer row needed for group-based customer ID resolution. */
 interface BcCustomerRow {
     id: number;
     first_name: string;
@@ -81,6 +99,7 @@ interface BcCustomerRow {
     company: string;
 }
 
+/** A BC order record returned by GET /v2/orders. */
 interface BcOrder {
     id: number;
     customer_id: number;
@@ -93,11 +112,13 @@ interface BcOrder {
     is_deleted: boolean;
 }
 
+/** A single extra field entry on a B2B quote record. */
 interface B2BQuoteExtraField {
     fieldName: string;
     fieldValue: string | number;
 }
 
+/** A B2B RFQ/quote record returned by GET /api/v3/io/rfq. */
 interface B2BQuote {
     quoteId: number;
     quoteNumber: string;
@@ -114,6 +135,7 @@ interface B2BQuote {
     extraFields: B2BQuoteExtraField[];
 }
 
+/** A B2B company address record used when placing orders. */
 interface B2BCompanyAddress {
     firstName: string;
     lastName: string;
@@ -127,21 +149,25 @@ interface B2BCompanyAddress {
     isDefaultBilling: boolean;
 }
 
+/** A single line item in a place-order request. */
 interface PlaceOrderLineItem {
     productId: number;
     quantity: number;
 }
 
+/** A single extra field entry on a B2B order record. */
 interface B2BOrderExtraField {
     fieldName: string;
     fieldValue: string;
 }
 
+/** A B2B order record as returned by GET /api/v3/io/orders/{bcOrderId}. */
 interface B2BOrderRecord {
     bcOrderId: number;
     extraFields?: B2BOrderExtraField[];
 }
 
+/** The BC order record returned immediately after POST /v2/orders. */
 interface BcCreatedOrder {
     id: number;
     date_created: string;
@@ -152,15 +178,22 @@ interface BcCreatedOrder {
     currency_code: string;
 }
 
+/**
+ * Type guard that returns true when value is a positive integer.
+ * @param value - Value to check.
+ * @returns True if value is a number, integer, and greater than zero.
+ */
 function isPositiveInteger(value: unknown): value is number {
     return typeof value === 'number' && Number.isInteger(value) && value > 0;
 }
 
 /**
-* Validates and normalizes the lineItems array from a place-order request body.
-* Returns null if the array is empty or any entry has a non-positive-integer
-* productId/quantity.
-*/
+ * Validates and normalizes the lineItems array from a place-order request body.
+ * Returns null if the array is empty or any entry has a non-positive-integer
+ * productId/quantity.
+ * @param raw - Unvalidated `lineItems` value from the request body.
+ * @returns Normalized `{ productId, quantity }[]`, or null if the input is invalid.
+ */
 function parseLineItems(raw: unknown): PlaceOrderLineItem[] | null {
     if (!Array.isArray(raw) || raw.length === 0) return null;
 
@@ -177,9 +210,11 @@ function parseLineItems(raw: unknown): PlaceOrderLineItem[] | null {
 }
 
 /**
-* Fetch a B2B company's address book.
-* BC OOTB: GET /api/v3/io/addresses?companyId={companyId}
-*/
+ * Fetch a B2B company's address book.
+ * BC OOTB: GET /api/v3/io/addresses?companyId={companyId}
+ * @param companyId - B2B company ID.
+ * @returns The company's addresses, or an empty array on failure.
+ */
 async function fetchB2BCompanyAddresses(companyId: number): Promise<B2BCompanyAddress[]> {
     try {
         const res = await b2bClient.get<{ data: B2BCompanyAddress[] }>('/api/v3/io/addresses', {
@@ -192,6 +227,11 @@ async function fetchB2BCompanyAddresses(companyId: number): Promise<B2BCompanyAd
     }
 }
 
+/**
+ * Turns a B2B order's extraFields array into a plain fieldName -> fieldValue map.
+ * @param extraFields - Raw extraFields array from a B2B order record, if any.
+ * @returns Flattened key/value map; empty object when there are no extra fields.
+ */
 function buildOrderExtraFieldsMap(extraFields?: B2BOrderExtraField[]): Record<string, string> {
     const map: Record<string, string> = {};
     (extraFields ?? []).forEach(f => {
@@ -201,13 +241,16 @@ function buildOrderExtraFieldsMap(extraFields?: B2BOrderExtraField[]): Record<st
 }
 
 /**
-* Registers a B2B order record for a core BigCommerce order.
-* BC does not automatically create this record for orders placed via the plain
-* REST Management `POST /v2/orders` (confirmed empirically in this store), so this
-* must be called explicitly right after order creation. Does not create a second
-* real order — only attaches B2B metadata to the existing BC order.
-* B2B OOTB: POST /api/v3/io/orders
-*/
+ * Registers a B2B order record for a core BigCommerce order.
+ * BC does not automatically create this record for orders placed via the plain
+ * REST Management `POST /v2/orders` (confirmed empirically in this store), so this
+ * must be called explicitly right after order creation. Does not create a second
+ * real order — only attaches B2B metadata to the existing BC order.
+ * B2B OOTB: POST /api/v3/io/orders
+ * @param bcOrderId - BigCommerce order ID to attach a B2B order record to.
+ * @param customerId - BC customer ID the order was created under.
+ * @returns Nothing — logs and swallows failures rather than throwing.
+ */
 async function registerB2BOrder(bcOrderId: number, customerId: number): Promise<void> {
     try {
         await b2bClient.post('/api/v3/io/orders', { bcOrderId, customerId });
@@ -217,9 +260,12 @@ async function registerB2BOrder(bcOrderId: number, customerId: number): Promise<
 }
 
 /**
-* Sets extra fields on a B2B order record (must already be registered).
-* B2B OOTB: PUT /api/v3/io/orders/{bcOrderId}
-*/
+ * Sets extra fields on a B2B order record (must already be registered).
+ * B2B OOTB: PUT /api/v3/io/orders/{bcOrderId}
+ * @param bcOrderId - BigCommerce order ID (must already have a registered B2B order record).
+ * @param fields - Extra fields to set, as a plain fieldName -> fieldValue map.
+ * @returns Nothing — logs and swallows failures rather than throwing.
+ */
 async function setB2BOrderExtraFields(bcOrderId: number, fields: Record<string, string>): Promise<void> {
     try {
         const extraFields = Object.entries(fields).map(([fieldName, fieldValue]) => ({ fieldName, fieldValue }));
@@ -229,25 +275,23 @@ async function setB2BOrderExtraFields(bcOrderId: number, fields: Record<string, 
     }
 }
 
-/**
-* Fetch a single B2B order's extra fields.
-*
-* The bulk `GET /api/v3/io/orders?companyId=` list does NOT include extraFields
-* (confirmed empirically — no query parameter unlocks it), so attribution has to
-* be read per order via the single-order endpoint instead.
-*
-* A 404 here is an expected, normal case — it means this order was never placed
-* through POST /orders (e.g. a company's own self-service order), not an error.
-* B2B OOTB: GET /api/v3/io/orders/{bcOrderId}
-*/
 // Cache keyed by BC order ID — an order's own createdBy/orderedFor never change once
 // set (or never get set at all, for a self-service order), so this never goes stale.
 // Cuts the dominant cost of GET /recent-orders: re-checking the same orders' B2B
 // attribution on every single page load.
 const MAX_CACHE_SIZE = 5000; // shared cap for all in-memory dashboard caches below
 
-// FIFO eviction (Map preserves insertion order) once a cache is full — keeps
-// memory bounded in a long-lived process without needing a full LRU/TTL scheme.
+/**
+ * Sets a key on a size-capped Map, evicting the oldest entry first (FIFO — Map
+ * preserves insertion order) once the map is already at its limit. Keeps the
+ * long-lived in-memory caches in this file bounded in a long-running process
+ * without a full LRU/TTL implementation.
+ * @param map - Cache to write into.
+ * @param key - Key to set.
+ * @param value - Value to store.
+ * @param maxSize - Maximum entries to retain before evicting the oldest (defaults to MAX_CACHE_SIZE).
+ * @returns Nothing — mutates `map` in place.
+ */
 function setWithLimit<K, V>(map: Map<K, V>, key: K, value: V, maxSize = MAX_CACHE_SIZE): void {
     if (map.size >= maxSize) {
         const oldestKey = map.keys().next().value;
@@ -256,8 +300,22 @@ function setWithLimit<K, V>(map: Map<K, V>, key: K, value: V, maxSize = MAX_CACH
     map.set(key, value);
 }
 
+/** Per-order attribution cache: maps BC order ID → B2B extra fields map. Never invalidated (attribution is immutable). */
 const orderAttributionCache = new Map<number, Record<string, string>>();
 
+/**
+ * Fetch a single B2B order's extra fields.
+ *
+ * The bulk `GET /api/v3/io/orders?companyId=` list does NOT include extraFields
+ * (confirmed empirically — no query parameter unlocks it), so attribution has to
+ * be read per order via the single-order endpoint instead.
+ *
+ * A 404 here is an expected, normal case — it means this order was never placed
+ * through POST /orders (e.g. a company's own self-service order), not an error.
+ * B2B OOTB: GET /api/v3/io/orders/{bcOrderId}
+ * @param bcOrderId - BigCommerce order ID to look up.
+ * @returns Map of extra field name to value; empty object if the order has no B2B record.
+ */
 async function fetchB2BOrderExtraFields(bcOrderId: number): Promise<Record<string, string>> {
     const cached = orderAttributionCache.get(bcOrderId);
     if (cached) return cached;
@@ -283,6 +341,7 @@ async function fetchB2BOrderExtraFields(bcOrderId: number): Promise<Record<strin
     }
 }
 
+/** Cached result of resolving a dealer's B2B company and its subsidiary companies. */
 interface DealerHierarchy {
     dealerCompanyId: number;
     dealerCompanyName: string;
@@ -290,18 +349,22 @@ interface DealerHierarchy {
     cachedAt: number;
 }
 
+/** In-memory hierarchy cache: maps dealer BC customer ID → their resolved DealerHierarchy. */
 const dealerHierarchyCache = new Map<number, DealerHierarchy>();
 
 /**
-* Resolves (and caches, 5 min TTL) a dealer's own B2B company, its name, and its
-* companies — shared by POST /orders and GET /recent-orders so neither has to
-* re-walk the full company list on every request for the same dealer.
-*
-* Companies are matched by `bcGroupName === dealer's own company name`, not by
-* B2B's `parentCompany` link — confirmed against real data that `parentCompany`
-* only covers a small fraction of a dealer's actual client companies in this
-* store, while bcGroupName correctly reflects all of them.
-*/
+ * Resolves (and caches, 5 min TTL) a dealer's own B2B company, its name, and its
+ * companies — shared by POST /orders and GET /recent-orders so neither has to
+ * re-walk the full company list on every request for the same dealer.
+ *
+ * Companies are matched by `bcGroupName === dealer's own company name`, not by
+ * B2B's `parentCompany` link — confirmed against real data that `parentCompany`
+ * only covers a small fraction of a dealer's actual client companies in this
+ * store, while bcGroupName correctly reflects all of them.
+ * @param dealerId - BC customer ID of the dealer.
+ * @param dealerEmail - Dealer's BC email, used to resolve their B2B company.
+ * @returns The dealer's own company plus its subsidiaries, or null if no B2B company/name resolves.
+ */
 async function resolveDealerHierarchy(dealerId: number, dealerEmail: string): Promise<DealerHierarchy | null> {
     const cached = dealerHierarchyCache.get(dealerId);
     if (cached && Date.now() - cached.cachedAt < HIERARCHY_CACHE_TTL_MS) {
@@ -333,18 +396,22 @@ async function resolveDealerHierarchy(dealerId: number, dealerEmail: string): Pr
     return resolved;
 }
 
+/** Cached B2B company user list with a timestamp for TTL checks. */
 interface CachedCompanyUsers {
     users: B2BCompanyUser[];
     cachedAt: number;
 }
 
+/** In-memory company users cache: maps B2B company ID → their users and fetch timestamp. */
 const companyUsersCache = new Map<number, CachedCompanyUsers>();
 
 /**
-* Cached wrapper (5 min TTL, same as the hierarchy cache) around fetchB2BCompanyUsers —
-* GET /recent-orders calls this once per subsidiary on every page load; company
-* membership doesn't change minute-to-minute, so this is a large repeat-call saving.
-*/
+ * Cached wrapper (5 min TTL, same as the hierarchy cache) around fetchB2BCompanyUsers —
+ * GET /recent-orders calls this once per subsidiary on every page load; company
+ * membership doesn't change minute-to-minute, so this is a large repeat-call saving.
+ * @param companyId - B2B company ID.
+ * @returns The company's B2B users (cached for up to 5 minutes).
+ */
 async function fetchB2BCompanyUsersCached(companyId: number): Promise<B2BCompanyUser[]> {
     const cached = companyUsersCache.get(companyId);
     if (cached && Date.now() - cached.cachedAt < HIERARCHY_CACHE_TTL_MS) {
@@ -355,6 +422,14 @@ async function fetchB2BCompanyUsersCached(companyId: number): Promise<B2BCompany
     return users;
 }
 
+/**
+ * Resolves every BC customer ID belonging to a dealer's own customer group,
+ * caching the result on the dealer's B2B user extra field (`dealer_customer_ids`)
+ * for up to CACHE_TTL_HOURS so GET /quotes doesn't re-walk the customer group on
+ * every request.
+ * @param dealerId - BC customer ID of the dealer.
+ * @returns All customer IDs in the dealer's own group, including the dealer's own ID.
+ */
 async function getDealerCustomerIds(dealerId: number): Promise<number[]> {
     // Step 1 — resolve dealer email from BC
     const customerRes = await bcClient.get('/v3/customers', { params: { 'id:in': dealerId } });
@@ -404,13 +479,29 @@ async function getDealerCustomerIds(dealerId: number): Promise<number[]> {
     return customerIds;
 }
 
-// GET /v1/dashboard/recent-orders?customerId=248&limit=3
-//
-// Scoped to orders the dealer actually placed — his own, or ones he placed for a
-// company via POST /orders — not every order under his company hierarchy. That
-// distinction lives on each order's own B2B `createdBy` extra field (written by
-// POST /orders), not on the order's customer_id, since BigCommerce has no native
-// concept of "who placed this order" separate from whose account it belongs to.
+/**
+ * GET /recent-orders
+ *
+ * Returns a dealer's recent orders plus total/open counts, scoped to orders the
+ * dealer actually placed — his own, or ones he placed for a company via POST
+ * /orders — not every order under his company hierarchy. That distinction lives
+ * on each order's own B2B `createdBy` extra field (written by POST /orders), not
+ * on the order's customer_id, since BigCommerce has no native concept of "who
+ * placed this order" separate from whose account it belongs to.
+ *
+ * Scoped by dealer company, not by the individual querying customerId: if a
+ * dealer company has more than one Admin (e.g. two co-admins), any of them can
+ * query with their own customerId and get the same company-wide result set,
+ * including self-placed orders from the *other* admin.
+ *
+ * Query: ?customerId=248&limit=3 (limit defaults to 3, capped at 50)
+ *
+ * Response:
+ * {
+ *   summary: { totalOrderCount, openOrderCount },
+ *   data: [{ orderId, orderNumber, date, orderedFor, createdBy, itemsTotal, total, currency, statusId, status, customerId }]
+ * }
+ */
 router.get('/recent-orders', async (req: Request, res: Response) => {
     try {
         const dealerId = Number(req.query.customerId);
@@ -433,10 +524,16 @@ router.get('/recent-orders', async (req: Request, res: Response) => {
         if (!hierarchy) {
             return res.json({ summary: { totalOrderCount: 0, openOrderCount: 0 }, data: [] });
         }
-        const { dealerCompanyName, subsidiaries } = hierarchy;
+        const { dealerCompanyId, dealerCompanyName, subsidiaries } = hierarchy;
 
-        // -- 2. Resolve every individual customer ID across the hierarchy --
-        const usersPerCompany = await batchedMap(subsidiaries, sub => fetchB2BCompanyUsersCached(sub.companyId), 5);
+        // -- 2. Resolve every individual customer ID across the hierarchy — including the
+        // dealer's OWN company's other users (e.g. a co-admin), not just subsidiaries, so
+        // one admin's self-placed order is visible to another admin of the same company --
+        const usersPerCompany = await batchedMap(
+            [dealerCompanyId, ...subsidiaries.map(sub => sub.companyId)],
+            companyId => fetchB2BCompanyUsersCached(companyId),
+            5
+        );
         const seenCustomerIds = new Set<number>([dealerId]);
         const customerIds: number[] = [dealerId];
         usersPerCompany.forEach(users => {
@@ -508,23 +605,28 @@ router.get('/recent-orders', async (req: Request, res: Response) => {
     }
 });
 
-// POST /v1/dashboard/orders
-// Body: { customerId: number, companyId: number, lineItems: [{ productId, quantity }], status?: string }
-// `customerId` is the dealer's own BC customer ID — named to match the customerId
-// convention already used by GET /recent-orders and GET /quotes.
-//
-// Lets a dealer place an order for themself (companyId === their own B2B companyId)
-// or on behalf of one of their subsidiary companies. BigCommerce orders can only
-// attach to one BC customer_id, so for a subsidiary the order is created under that
-// company's Admin user (first one found), using the company's default billing
-// address. BigCommerce has no native "placed by" field on an order, so who really
-// placed it is recorded on the order's own B2B extra fields (`orderedFor`,
-// `createdBy`) — visible in the B2B admin panel and read back by GET /recent-orders
-// to scope results.
-//
-// `status` is one of BigCommerce's OOTB status labels — Pending, Awaiting Fulfillment,
-// Shipped, Completed, Cancelled — mapped to the corresponding BC status_id. Defaults
-// to "Pending" when omitted.
+/**
+ * POST /orders
+ *
+ * Lets a dealer place a no-payment BC order for themself (companyId === their own
+ * B2B companyId) or on behalf of one of their subsidiary companies. BigCommerce
+ * orders can only attach to one BC customer_id, so for a subsidiary the order is
+ * created under that company's Admin user (first one found), using the company's
+ * default billing address. BigCommerce has no native "placed by" field on an
+ * order, so who really placed it is recorded on the order's own B2B extra fields
+ * (`orderedFor`, `createdBy`) — visible in the B2B admin panel and read back by
+ * GET /recent-orders to scope results.
+ *
+ * Body: { customerId: number, companyId: number, lineItems: [{ productId, quantity }], status?: string }
+ *
+ * `customerId` is the dealer's own BC customer ID — named to match the customerId
+ * convention already used by GET /recent-orders and GET /quotes. `status` is one
+ * of BigCommerce's OOTB status labels — Pending, Awaiting Fulfillment, Shipped,
+ * Completed, Cancelled — mapped to the corresponding BC status_id. Defaults to
+ * "Pending" when omitted.
+ *
+ * Response: { orderId, orderNumber, date, orderedFor, createdBy, itemsTotal, total, currency, statusId, status, companyId }
+ */
 router.post('/orders', async (req: Request, res: Response) => {
     try {
         const {
@@ -666,7 +768,21 @@ router.post('/orders', async (req: Request, res: Response) => {
     }
 });
 
-// GET /v1/dashboard/quotes?customerId=248&limit=10
+/**
+ * GET /quotes
+ *
+ * Returns open B2B RFQ/quotes scoped to a dealer's own customer group, plus an
+ * open-quote count. A quote is attributed to the dealer via its `Customer
+ * Account ID` extra field matching one of the dealer's group's customer IDs.
+ *
+ * Query: ?customerId=248&limit=10 (limit defaults to 10, capped at 50)
+ *
+ * Response:
+ * {
+ *   summary: { openQuoteCount },
+ *   data: [{ quoteId, quoteNumber, quoteTitle, date, expiresAt, createdBy, companyName, subtotal, grandTotal, currency, status, bcOrderId }]
+ * }
+ */
 router.get('/quotes', async (req: Request, res: Response) => {
     try {
         const dealerId = Number(req.query.customerId);
@@ -718,4 +834,3 @@ router.get('/quotes', async (req: Request, res: Response) => {
 });
 
 export default router;
- 

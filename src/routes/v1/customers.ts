@@ -4,6 +4,7 @@ import logger from '../../config/logger';
 
 const router = Router();
 
+/** A BigCommerce customer record subset as returned by GET /v3/customers. */
 interface BcCustomer {
     id: number;
     email: string;
@@ -16,6 +17,7 @@ interface BcCustomer {
     date_modified: string;
 }
 
+/** Pagination metadata from a BigCommerce v3 API list response envelope. */
 interface BcPagination {
     total: number;
     count: number;

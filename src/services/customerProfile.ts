@@ -1,8 +1,10 @@
 import bcClient from './bigcommerce';
 import logger from '../config/logger';
 
+/** TTL for the customer profile cache (5 minutes — customer_group_id changes rarely). */
 const PROFILE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes — customer_group_id changes rarely
 
+/** A BC customer record as returned by GET /v3/customers. */
 export interface BcCustomer {
     id: number;
     email: string;
@@ -13,11 +15,13 @@ export interface BcCustomer {
     customer_group_id: number | null;
 }
 
+/** In-memory cache entry for a fetched BC customer profile. */
 interface ProfileCacheEntry {
     data: BcCustomer | null;
     expiresAt: number;
 }
 
+/** In-memory cache of BC customer profiles, keyed by BC customer ID string. */
 const profileCache = new Map<string, ProfileCacheEntry>();
 
 /**
@@ -25,6 +29,8 @@ const profileCache = new Map<string, ProfileCacheEntry>();
  * BC OOTB: GET /v3/customers?id:in=:customerId
  * Cached per customerId for PROFILE_CACHE_TTL_MS to avoid re-fetching on repeated calls
  * (e.g. successive searches by the same dealer in a session).
+ * @param customerId - BC customer ID, as a string.
+ * @returns The customer's BC profile, or null if not found or the lookup fails.
  */
 export default async function fetchCustomerProfile(customerId: string): Promise<BcCustomer | null> {
     const cached = profileCache.get(customerId);

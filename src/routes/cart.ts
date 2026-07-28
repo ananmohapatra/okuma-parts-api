@@ -11,6 +11,7 @@ const router = Router();
 // Types
 // ---------------------------------------------------------------------------
 
+/** Shape of a physical line item returned in BC cart responses. */
 interface LineItem {
     id: string;
     product_id: number;
@@ -23,6 +24,7 @@ interface LineItem {
     image_url?: string;
 }
 
+/** Top-level cart object returned by the BC V3 Carts API. */
 interface BcCart {
     id: string;
     customer_id: number;
@@ -37,12 +39,14 @@ interface BcCart {
     };
 }
 
+/** Redirect URL set returned by BC POST /v3/carts/:cartId/redirect_urls. */
 interface BcRedirectUrls {
     cart_url: string;
     checkout_url: string;
     embedded_checkout_url: string;
 }
 
+/** Expected request body shape for POST /cart/items. */
 interface AddItemBody {
     productId?: unknown;
     quantity?: unknown;
@@ -57,16 +61,30 @@ interface AddItemBody {
 // Session helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Read the active cart ID from the Express session.
+ * @param req - Express request carrying the session.
+ * @returns The stored cart UUID, or null when no cart is active.
+ */
 function getCartId(req: Request): string | null {
     const session = req.session as unknown as Record<string, unknown> & { cartId?: string };
     return session.cartId ?? null;
 }
 
+/**
+ * Write the active cart ID into the Express session.
+ * @param req - Express request carrying the session.
+ * @param cartId - BC cart UUID to persist.
+ */
 function setCartId(req: Request, cartId: string): void {
     const session = req.session as unknown as Record<string, unknown> & { cartId?: string };
     session.cartId = cartId;
 }
 
+/**
+ * Remove the cart ID from the session, e.g. after the cart is deleted or expires on BC.
+ * @param req - Express request carrying the session.
+ */
 function clearCartId(req: Request): void {
     const session = req.session as unknown as Record<string, unknown> & { cartId?: string };
     delete session.cartId;
@@ -76,6 +94,12 @@ function clearCartId(req: Request): void {
 // BC Cart helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Fetch checkout redirect URLs for an existing BC cart.
+ * BC OOTB: POST /v3/carts/:cartId/redirect_urls
+ * @param cartId - BC cart UUID.
+ * @returns Object containing cart_url, checkout_url, and embedded_checkout_url.
+ */
 async function fetchRedirectUrls(cartId: string): Promise<BcRedirectUrls> {
     const res = await bcClient.post<{ data: BcRedirectUrls }>(`/v3/carts/${cartId}/redirect_urls`);
     return res.data.data;
@@ -88,6 +112,11 @@ async function fetchRedirectUrls(cartId: string): Promise<BcRedirectUrls> {
  * pricing (e.g. dealer/Distributor group) for every line item in the cart.
  * Appending items to an already-created cart does not need it again, since
  * the cart's customer binding was already set here.
+ * @param productId - BC product ID to add.
+ * @param quantity - Quantity of the product to add.
+ * @param variantId - Optional BC variant ID, if the product has variants.
+ * @param customerId - Optional BC customer ID to bind the cart to, for group-specific pricing.
+ * @returns The newly created BC cart.
  */
 async function createCart(
     productId: number,
@@ -305,6 +334,7 @@ router.post('/cart/items', async (req: Request, res: Response) => {
     }
 });
 
+/** Normalised cart shape returned by all cart read endpoints. */
 interface ShapedCart {
     cartId: string;
     customerId: number;

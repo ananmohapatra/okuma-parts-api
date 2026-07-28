@@ -111,11 +111,11 @@ function createdOrder(id: number, statusId = 1) {
 }
 
 /**
-* Wires up the B2B GET dispatcher (email lookup, company lookup, subsidiary
-* list, company users, addresses) that both POST /orders and GET /recent-orders
-* rely on via resolveDealerHierarchy. URL-dispatched rather than order-dependent
-* since both routes make many distinct B2B calls.
-*/
+ * Wires up the B2B GET dispatcher (email lookup, company lookup, subsidiary
+ * list, company users, addresses) that both POST /orders and GET /recent-orders
+ * rely on via resolveDealerHierarchy. URL-dispatched rather than order-dependent
+ * since both routes make many distinct B2B calls.
+ */
 function setupHierarchy(opts: {
     dealerCompanyId: number;
     dealerCompanyName: string;
@@ -549,6 +549,77 @@ describe('Dashboard orders API', () => {
             expect(res.body.data[0].orderedFor).toBe('Self');
             expect(res.body.data[0].createdBy).toBe('Dealer Co 304');
         });
+
+        it("includes a self-order placed by a co-admin of the dealer's own company, not just the querying user", async () => {
+            // Two Admins share the same dealer company: customer 305 is querying, customer
+            // 999 is a co-admin who placed a self-order. Both must resolve as candidates.
+            mockBcGet.mockImplementation((url: string, config?: { params?: Record<string, unknown> }) => {
+                if (url === '/v3/customers' && config?.params?.['id:in'] === 305) {
+                    return Promise.resolve(dealerRecord(305, 'dealer305@test.com'));
+                }
+                if (typeof url === 'string' && url.startsWith('/v2/orders?customer_id=305')) {
+                    return Promise.resolve({ data: [] });
+                }
+                if (typeof url === 'string' && url.startsWith('/v2/orders?customer_id=999')) {
+                    return Promise.resolve({
+                        data: [
+                            {
+                                id: 7002,
+                                customer_id: 999,
+                                date_created: '2026-01-05T00:00:00Z',
+                                status_id: 1,
+                                status: 'Pending',
+                                items_total: 1,
+                                total_inc_tax: '25.0000',
+                                currency_code: 'USD',
+                                is_deleted: false,
+                            },
+                        ],
+                    });
+                }
+                return Promise.resolve({ data: { data: [] } });
+            });
+
+            setupHierarchy({
+                dealerCompanyId: 1305,
+                dealerCompanyName: 'Dealer Co 305',
+                subsidiaries: [],
+                companyUsersByCompanyId: {
+                    1305: [{ customerId: 999, email: 'coadmin@dealer305.com', companyRoleName: 'Admin' }],
+                },
+            });
+            mockB2bGet.mockImplementation((url: string, config?: { params?: Record<string, unknown> }) => {
+                const params = config?.params ?? {};
+                if (url === '/api/v3/io/users' && params.email) return Promise.resolve(b2bUserByEmail(1305));
+                if (url === '/api/v3/io/users' && params.companyId === 1305) {
+                    return Promise.resolve(
+                        b2bCompanyUsers([{ customerId: 999, email: 'coadmin@dealer305.com', companyRoleName: 'Admin' }])
+                    );
+                }
+                if (url === '/api/v3/io/companies/1305') return Promise.resolve(b2bCompanyById('Dealer Co 305'));
+                if (url === '/api/v3/io/companies') return Promise.resolve(b2bCompanyList([]));
+                if (url === '/api/v3/io/orders/7002') {
+                    return Promise.resolve({
+                        data: {
+                            data: {
+                                extraFields: [
+                                    { fieldName: 'orderedFor', fieldValue: 'Self' },
+                                    { fieldName: 'createdBy', fieldValue: 'Dealer Co 305' },
+                                ],
+                            },
+                        },
+                    });
+                }
+                return Promise.resolve({ data: { data: [] } });
+            });
+
+            const res = await request(app).get(`${RECENT_ORDERS_URL}?customerId=305`).set(AUTH);
+
+            expect(res.status).toBe(200);
+            expect(res.body.summary.totalOrderCount).toBe(1);
+            expect(res.body.data[0].orderId).toBe(7002);
+            expect(res.body.data[0].customerId).toBe(999);
+            expect(res.body.data[0].createdBy).toBe('Dealer Co 305');
+        });
     });
 });
- 
