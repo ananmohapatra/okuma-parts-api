@@ -302,10 +302,15 @@ router.get(
 // Machines
 // ---------------------------------------------------------------------------
 
+interface PublicationNo {
+    pubNo: string;
+    pubDate: string | null;
+}
+
 interface B2BMachine {
     modelNo?: string;
     serialNo?: string;
-    publicationNos?: string[];
+    publicationNos?: Array<PublicationNo | string>;
     installDate?: string;
     status?: string;
     imageName?: string;
@@ -377,7 +382,9 @@ router.get('/customer/:customerId/machines', async (req: Request, res: Response,
                 return true;
             })
             .map(m => {
-                const pubNos = m.publicationNos ?? [];
+                const pubNos = (m.publicationNos ?? []).map(entry =>
+                    typeof entry === 'string' ? { pubNo: entry, pubDate: null } : entry
+                );
                 return {
                     serial: m.serialNo ?? null,
                     model: m.modelNo ?? null,
