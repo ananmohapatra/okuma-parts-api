@@ -168,7 +168,7 @@ router.post('/bluesnap/charge', async (req: Request, res: Response) => {
                     firstName: holderFirst,
                     lastName: holderLast,
                 },
-                transactionType: 'AUTH_CAPTURE',
+                transactionType: 'AUTH',
             },
             {
                 headers: {
