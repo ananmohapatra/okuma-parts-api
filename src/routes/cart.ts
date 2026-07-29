@@ -221,9 +221,13 @@ router.post('/cart/items', async (req: Request, res: Response) => {
         return res.status(403).json({ error: 'Forbidden.' });
     }
 
-    // Kick off stock fetch and dealer location resolution in parallel with cart operation.
+    // Kick off stock fetch, custom fields, and dealer location resolution in parallel with cart operation.
     const stockFetchPromise: Promise<Record<string, BcInventoryItem>> =
         typeof sku === 'string' ? fetchLocationInventory([sku]) : Promise.resolve({});
+    const customFieldsPromise: Promise<Array<{ name: string; value: string }>> = bcClient
+        .get<{ data: Array<{ name: string; value: string }> }>(`/v3/catalog/products/${productId}/custom-fields`)
+        .then(r => r.data?.data ?? [])
+        .catch(() => []);
     let dealerLocPromise: Promise<number | null> = Promise.resolve(null);
     if (typeof sku === 'string' && customerId) {
         dealerLocPromise =
@@ -265,25 +269,32 @@ router.post('/cart/items', async (req: Request, res: Response) => {
 
         setCartId(req, cart.id);
 
-        const [redirectUrls, invMap, dealerLocId] = await Promise.all([
+        const [redirectUrls, invMap, dealerLocId, customFields] = await Promise.all([
             fetchRedirectUrls(cart.id),
             stockFetchPromise,
             dealerLocPromise,
+            customFieldsPromise,
         ]);
 
         const physicalItems = cart.line_items?.physical_items ?? [];
 
+        const soStop = customFields.find(f => f.name === 'so_stop_flag')?.value?.toLowerCase() === 'true';
+        const poStop = customFields.find(f => f.name === 'po_stop_flag')?.value?.toLowerCase() === 'true';
+
         let stockResult: ReturnType<typeof resolveStock> | null = null;
         if (typeof sku === 'string') {
-            if (inventoryTracking === 'none') {
+            if (soStop) {
+                stockResult = resolveStock(undefined, null, true, false);
+            } else if (inventoryTracking === 'none') {
                 stockResult = {
                     inStock: true,
+                    stockStatus: 'in_stock',
                     stockSource: 'okuma',
                     availableStock: null,
                     shippingDetails: 'Ships from Okuma in 5-7 business days',
                 };
             } else {
-                stockResult = resolveStock(invMap[sku], dealerLocId);
+                stockResult = resolveStock(invMap[sku], dealerLocId, soStop, poStop);
             }
         }
 
@@ -313,6 +324,7 @@ router.post('/cart/items', async (req: Request, res: Response) => {
                 embeddedCheckoutUrl: redirectUrls.embedded_checkout_url,
             },
             ...(stockResult !== null && {
+                stockStatus: stockResult.stockStatus,
                 stockSource: stockResult.stockSource,
                 availableStock: stockResult.availableStock,
                 shippingDetails: stockResult.shippingDetails,

@@ -4,7 +4,7 @@ import config from '../../config';
 import logger from '../../config/logger';
 import bcClient from '../../services/bigcommerce';
 import b2bClient from '../../services/b2b';
-import { fetchLocationInventory, hasAnyStock } from '../../services/inventory';
+import { fetchLocationInventory, resolveStock, StockStatus } from '../../services/inventory';
 import { AppError, NotFoundError } from '../../middleware/errors';
 
 const router = Router();
@@ -75,6 +75,7 @@ interface BcLookupEntry {
     productId: number | null;
     price: number | null;
     inStock: boolean;
+    stockStatus: StockStatus;
 }
 
 /** A BC product record subset returned by GET /v3/catalog/products. */
@@ -84,6 +85,7 @@ interface BcProduct {
     price: number;
     inventory_tracking: string;
     availability: string;
+    custom_fields: Array<{ name: string; value: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -299,17 +301,34 @@ router.get(
                                 'sku:in': matchedSkus.join(','),
                                 limit: 50,
                                 include_fields: 'id,sku,name,price,inventory_tracking,availability',
+                                include: 'custom_fields',
                             },
                         }),
                         fetchLocationInventory(matchedSkus),
                     ]);
 
                     (response.data?.data ?? []).forEach(product => {
-                        const notTracked = product.inventory_tracking === 'none';
-                        const inStock =
-                            product.availability === 'available' &&
-                            (notTracked || hasAnyStock(inventoryBySku[product.sku]));
-                        bcLookup[product.sku] = { productId: product.id, price: product.price, inStock };
+                        const customFields = product.custom_fields ?? [];
+                        const soStop =
+                            customFields.find(f => f.name === 'so_stop_flag')?.value?.toLowerCase() === 'true';
+                        const poStop =
+                            customFields.find(f => f.name === 'po_stop_flag')?.value?.toLowerCase() === 'true';
+
+                        let stockStatus: StockStatus;
+                        if (product.availability !== 'available' || soStop) {
+                            stockStatus = 'not_available';
+                        } else if (product.inventory_tracking === 'none') {
+                            stockStatus = 'in_stock';
+                        } else {
+                            stockStatus = resolveStock(inventoryBySku[product.sku], null, soStop, poStop).stockStatus;
+                        }
+
+                        bcLookup[product.sku] = {
+                            productId: product.id,
+                            price: product.price,
+                            inStock: stockStatus === 'in_stock',
+                            stockStatus,
+                        };
                     });
                 } catch (err) {
                     logger.error(`parts-book: BC product lookup failed: ${(err as Error).message}`);
@@ -340,6 +359,7 @@ router.get(
                     matchingTableRowCount: p.matching_table_row_count ?? null,
                     price: bc ? bc.price : null,
                     inStock: bc ? bc.inStock : false,
+                    stockStatus: bc ? bc.stockStatus : 'not_available',
                     productId: bc ? bc.productId : null,
                 };
             });

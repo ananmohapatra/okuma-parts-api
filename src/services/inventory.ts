@@ -18,12 +18,16 @@ export interface BcInventoryItem {
     locations: BcInventoryLocation[];
 }
 
-/** Identifies which location is fulfilling a stock check: dealer warehouse, Okuma warehouse, or none (backorder). */
-export type StockSource = 'dealer' | 'okuma' | 'none';
+/** Identifies which location is fulfilling a stock check. */
+export type StockSource = 'dealer' | 'okuma' | 'global' | 'none';
+
+/** Five-state stock status matching the business priority logic. */
+export type StockStatus = 'not_available' | 'in_stock' | 'global_stock' | 'while_supplies_last' | 'backorder';
 
 /** Resolved stock availability result for a single SKU, including source and shipping message. */
 export interface StockResult {
     inStock: boolean;
+    stockStatus: StockStatus;
     stockSource: StockSource;
     availableStock: number | null;
     shippingDetails: string;
@@ -61,50 +65,113 @@ export async function fetchLocationInventory(skus: string[]): Promise<Record<str
     }
 }
 
+/** Returns true when a location name corresponds to an Okuma America warehouse (not Germany or Japan). */
+function isOkumaAmericaLocation(name: string): boolean {
+    const n = normalizeForMatch(name);
+    return n.includes('okuma') && !n.includes('germany') && !n.includes('japan');
+}
+
+/** Returns true when a location name corresponds to a global Okuma warehouse (Germany or Japan). */
+function isGlobalLocation(name: string): boolean {
+    const n = normalizeForMatch(name);
+    return n.includes('germany') || n.includes('japan');
+}
+
+// ---------------------------------------------------------------------------
+// StockResult builders — one per outcome, keeps resolveStock under 30 lines
+// ---------------------------------------------------------------------------
+
+function notAvailableResult(): StockResult {
+    return {
+        inStock: false,
+        stockStatus: 'not_available',
+        stockSource: 'none',
+        availableStock: null,
+        shippingDetails: 'This part is not available.',
+    };
+}
+
+function inStockResult(stockSource: 'dealer' | 'okuma', availableStock: number, shippingDetails: string): StockResult {
+    return { inStock: true, stockStatus: 'in_stock', stockSource, availableStock, shippingDetails };
+}
+
+function globalStockResult(availableStock: number): StockResult {
+    return {
+        inStock: false,
+        stockStatus: 'global_stock',
+        stockSource: 'global',
+        availableStock,
+        shippingDetails: 'Available from global Okuma inventory — contact your dealer for lead time.',
+    };
+}
+
+function whileSuppliesLastResult(): StockResult {
+    return {
+        inStock: false,
+        stockStatus: 'while_supplies_last',
+        stockSource: 'none',
+        availableStock: null,
+        shippingDetails: 'Limited availability — contact your dealer.',
+    };
+}
+
+function backorderResult(): StockResult {
+    return {
+        inStock: false,
+        stockStatus: 'backorder',
+        stockSource: 'none',
+        availableStock: null,
+        shippingDetails: 'Will be shipped once available.',
+    };
+}
+
 /**
- * Resolve stock source for a single inventory item.
+ * Resolve stock status for a single inventory item using the 6-priority business rule.
  *
  * Priority:
- *   1. Dealer's location (matched by location_id when dealerLocId is provided).
- *   2. Okuma US Warehouse (location name contains "okuma").
- *   3. none — backorder.
+ *   1. SO Stop = true  → not_available (D365 flag; wins over all inventory checks).
+ *   2. Dealer location has stock → in_stock (dealer).
+ *   3. Okuma America has stock → in_stock (okuma).
+ *   4. Okuma Germany or Japan has stock → global_stock.
+ *   5. PO Stop = true, no stock anywhere → while_supplies_last (phase-out; no replenishment).
+ *   6. No stock anywhere → backorder.
  *
  * BC does not aggregate multi-location stock into the product's inventory_level,
  * so all stock checks must go through the /v3/inventory/items response.
  */
-export function resolveStock(invItem: BcInventoryItem | undefined, dealerLocId: number | null): StockResult {
+export function resolveStock(
+    invItem: BcInventoryItem | undefined,
+    dealerLocId: number | null,
+    soStop = false,
+    poStop = false
+): StockResult {
+    if (soStop) return notAvailableResult();
+
     if (invItem) {
         if (dealerLocId !== null) {
             const dealerLoc = invItem.locations.find(loc => loc.location_enabled && loc.location_id === dealerLocId);
-            if (dealerLoc && dealerLoc.available_to_sell > 0) {
-                return {
-                    inStock: true,
-                    stockSource: 'dealer',
-                    availableStock: dealerLoc.available_to_sell,
-                    shippingDetails: 'In stock at your dealer — ships in 1-3 business days',
-                };
-            }
+            if (dealerLoc && dealerLoc.available_to_sell > 0)
+                return inStockResult(
+                    'dealer',
+                    dealerLoc.available_to_sell,
+                    'In stock at your dealer — ships in 1-3 business days'
+                );
         }
 
         const okumaLoc = invItem.locations.find(
-            loc => loc.location_enabled && normalizeForMatch(loc.location_name).includes('okuma')
+            loc => loc.location_enabled && isOkumaAmericaLocation(loc.location_name) && loc.available_to_sell > 0
         );
-        if (okumaLoc && okumaLoc.available_to_sell > 0) {
-            return {
-                inStock: true,
-                stockSource: 'okuma',
-                availableStock: okumaLoc.available_to_sell,
-                shippingDetails: 'Ships from Okuma in 5-7 business days',
-            };
-        }
+        if (okumaLoc)
+            return inStockResult('okuma', okumaLoc.available_to_sell, 'Ships from Okuma in 5-7 business days');
+
+        const globalLoc = invItem.locations.find(
+            loc => loc.location_enabled && isGlobalLocation(loc.location_name) && loc.available_to_sell > 0
+        );
+        if (globalLoc) return globalStockResult(globalLoc.available_to_sell);
     }
 
-    return {
-        inStock: false,
-        stockSource: 'none',
-        availableStock: null,
-        shippingDetails: 'Will be shipped once available',
-    };
+    if (poStop) return whileSuppliesLastResult();
+    return backorderResult();
 }
 
 /**
@@ -129,7 +196,7 @@ interface BcLocationEntry {
 }
 
 /** TTL for the cached BC inventory locations list (30 minutes — location codes rarely change). */
-const LOCATION_LIST_CACHE_TTL_MS = 30 * 60 * 1000; // 30 min — location codes rarely change
+const LOCATION_LIST_CACHE_TTL_MS = 30 * 60 * 1000;
 /** TTL for the per-customer dealer location ID cache (5 minutes). */
 const DEALER_LOC_CACHE_TTL_MS = 5 * 60 * 1000;
 
@@ -209,7 +276,7 @@ export async function resolveDealerLocationId(customerId: string): Promise<numbe
         }
 
         const match = locations.find(
-            loc => loc.enabled && (loc.code === distributorId || loc.code.includes(distributorId))
+            loc => loc.enabled && (loc.code === distributorId || loc.code.endsWith(`-${distributorId}`))
         );
 
         if (!match) {

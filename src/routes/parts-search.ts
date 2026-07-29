@@ -1,7 +1,14 @@
 import { Router, Request, Response } from 'express';
 import bcClient from '../services/bigcommerce';
 import fetchCustomerProfile from '../services/customerProfile';
-import { fetchLocationInventory, resolveStock, resolveDealerLocationId, BcInventoryItem } from '../services/inventory';
+import {
+    fetchLocationInventory,
+    resolveStock,
+    resolveDealerLocationId,
+    BcInventoryItem,
+    StockStatus,
+    StockResult,
+} from '../services/inventory';
 import logger from '../config/logger';
 import config from '../config';
 
@@ -20,6 +27,7 @@ interface BcSearchProduct {
     availability: string;
     inventory_tracking: 'none' | 'product' | 'variant';
     inventory_level: number;
+    custom_fields: Array<{ name: string; value: string }>;
 }
 
 /** Shape of a single pricing item returned by BC POST /v3/pricing/products. */
@@ -45,8 +53,8 @@ interface PartResult {
     unitPrice: number | null;
     originalPrice: number | null;
     status: string;
-    stockStatus: 'instock' | 'backorder';
-    stockSource: 'dealer' | 'okuma' | 'none';
+    stockStatus: StockStatus;
+    stockSource: StockResult['stockSource'];
     availableStock: number | null;
     shippingDetails: string;
 }
@@ -136,12 +144,18 @@ router.get('/parts/search', async (req: Request, res: Response) => {
         return res.status(400).json({ error: 'sort must be "name_asc" or "name_desc" when provided.' });
     }
 
-    const pageNum = parseInt(page, 10);
-    if (!Number.isInteger(pageNum) || pageNum < 1) {
+    if (!/^\d+$/.test(page)) {
         return res.status(400).json({ error: 'page must be a positive integer.' });
     }
+    const pageNum = parseInt(page, 10);
+    if (pageNum < 1) {
+        return res.status(400).json({ error: 'page must be a positive integer.' });
+    }
+    if (!/^\d+$/.test(limit)) {
+        return res.status(400).json({ error: 'limit must be a positive integer.' });
+    }
     const rawLimitNum = parseInt(limit, 10);
-    if (!Number.isInteger(rawLimitNum) || rawLimitNum < 1) {
+    if (rawLimitNum < 1) {
         return res.status(400).json({ error: 'limit must be a positive integer.' });
     }
     const limitNum = Math.min(rawLimitNum, MAX_LIMIT);
@@ -159,7 +173,7 @@ router.get('/parts/search', async (req: Request, res: Response) => {
         const [profile, searchRes, resolvedDealerLocId] = await Promise.all([
             fetchCustomerProfile(customerId),
             bcClient.get<{ data: BcSearchProduct[]; meta: { pagination: { total: number } } }>('/v3/catalog/products', {
-                params: { keyword: q.trim(), page, limit: limitNum, ...sortParams },
+                params: { keyword: q.trim(), page: pageNum, limit: limitNum, ...sortParams, include: 'custom_fields' },
             }),
             dealerLocationId ? Promise.resolve(parseInt(dealerLocationId, 10)) : resolveDealerLocationId(customerId),
         ]);
@@ -187,24 +201,37 @@ router.get('/parts/search', async (req: Request, res: Response) => {
 
         const results: PartResult[] = products.map(p => {
             const pricing = priceByProductId[p.id] ?? { unitPrice: null, originalPrice: null };
+            const customFields = p.custom_fields ?? [];
+            const soStop = customFields.find(f => f.name === 'so_stop_flag')?.value?.toLowerCase() === 'true';
+            const poStop = customFields.find(f => f.name === 'po_stop_flag')?.value?.toLowerCase() === 'true';
 
-            let stockResult;
+            let stockResult: StockResult;
             if (p.availability !== 'available') {
                 stockResult = {
                     inStock: false,
-                    stockSource: 'none' as const,
+                    stockStatus: 'not_available',
+                    stockSource: 'none',
                     availableStock: null,
-                    shippingDetails: 'Will be shipped once available',
+                    shippingDetails: 'Not available.',
+                };
+            } else if (soStop) {
+                stockResult = {
+                    inStock: false,
+                    stockStatus: 'not_available',
+                    stockSource: 'none',
+                    availableStock: null,
+                    shippingDetails: 'This part is not available.',
                 };
             } else if (p.inventory_tracking === 'none') {
                 stockResult = {
                     inStock: true,
-                    stockSource: 'okuma' as const,
+                    stockStatus: 'in_stock',
+                    stockSource: 'okuma',
                     availableStock: null,
                     shippingDetails: 'Ships from Okuma in 5-7 business days',
                 };
             } else {
-                stockResult = resolveStock(inventoryBySku[p.sku], dealerLocId);
+                stockResult = resolveStock(inventoryBySku[p.sku], dealerLocId, soStop, poStop);
             }
 
             return {
@@ -215,7 +242,7 @@ router.get('/parts/search', async (req: Request, res: Response) => {
                 unitPrice: pricing.unitPrice,
                 originalPrice: pricing.originalPrice,
                 status: p.availability,
-                stockStatus: stockResult.inStock ? 'instock' : 'backorder',
+                stockStatus: stockResult.stockStatus,
                 stockSource: stockResult.stockSource,
                 availableStock: stockResult.availableStock,
                 shippingDetails: stockResult.shippingDetails,

@@ -9,6 +9,7 @@ import v1Router from './v1';
 import customer from './customer';
 import customers from './customers';
 import cart from './cart';
+import checkout from './checkout';
 import dashboard from './dashboard';
 import partsSearch from './parts-search';
 import payments from './payments';
@@ -39,9 +40,10 @@ router.use('/payments', apiLimiter, payments);
 // routes must come first or that endpoint would incorrectly hit apiLimiter + authenticateBCToken
 // (and 401 for any real Stencil/browser caller with no X-Auth-Token) before ever reaching its
 // own handler.
-router.use('/v1', customer);
-router.use('/v1', customers);
+router.use('/v1', apiLimiter, customer);
+router.use('/v1', apiLimiter, customers);
 router.use('/v1', apiLimiter, cart);
+router.use('/v1', apiLimiter, checkout);
 router.use('/v1', apiLimiter, partsSearch);
 router.use('/v1/dashboard', apiLimiter, authenticateBCToken, dashboard);
 

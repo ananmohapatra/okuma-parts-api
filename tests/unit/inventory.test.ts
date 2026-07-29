@@ -89,6 +89,78 @@ describe('inventory service', () => {
                 })
             );
         });
+
+        it('returns not_available when soStop is true regardless of inventory', () => {
+            const result = resolveStock(
+                inventoryItem([location(18, 'Dealer Location', 10), location(9, 'Okuma-US Warehouse', 5)]),
+                18,
+                true
+            );
+
+            expect(result).toEqual(
+                expect.objectContaining({
+                    inStock: false,
+                    stockStatus: 'not_available',
+                    stockSource: 'none',
+                    availableStock: null,
+                })
+            );
+        });
+
+        it('returns while_supplies_last when poStop is true and no stock anywhere', () => {
+            const result = resolveStock(
+                inventoryItem([location(18, 'Dealer Location', 0), location(9, 'Okuma-US Warehouse', 0)]),
+                18,
+                false,
+                true
+            );
+
+            expect(result).toEqual(
+                expect.objectContaining({
+                    inStock: false,
+                    stockStatus: 'while_supplies_last',
+                    stockSource: 'none',
+                    availableStock: null,
+                })
+            );
+        });
+
+        it('returns global_stock when only a global location (Germany/Japan) has stock', () => {
+            const result = resolveStock(
+                inventoryItem([
+                    location(18, 'Dealer Location', 0),
+                    location(9, 'Okuma-US Warehouse', 0),
+                    location(20, 'Okuma Germany Warehouse', 7),
+                ]),
+                18
+            );
+
+            expect(result).toEqual(
+                expect.objectContaining({
+                    inStock: false,
+                    stockStatus: 'global_stock',
+                    stockSource: 'global',
+                    availableStock: 7,
+                })
+            );
+        });
+
+        it('prefers in_stock over while_supplies_last when poStop is true but stock exists', () => {
+            const result = resolveStock(
+                inventoryItem([location(9, 'Okuma-US Warehouse', 3)]),
+                null,
+                false,
+                true
+            );
+
+            expect(result).toEqual(
+                expect.objectContaining({
+                    inStock: true,
+                    stockStatus: 'in_stock',
+                    stockSource: 'okuma',
+                })
+            );
+        });
     });
 
     describe('resolveDealerLocationId', () => {
