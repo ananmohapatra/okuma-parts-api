@@ -93,12 +93,25 @@ function toCheckoutAddress(addr: B2BAddress, email: string): BcCheckoutAddress {
     };
 }
 
+const B2B_ORDER_MAX_RETRIES = 15;
+const B2B_ORDER_RETRY_DELAY_MS = 3000;
+
 /**
  * Write checkout metadata to B2B order extra fields in a single PUT call.
- * Fields are visible in the B2B admin portal and Buyer Portal against the order.
+ * Retries up to 5 times with a 2 s delay because B2B syncs new BC orders via
+ * webhook and the order may not exist in B2B immediately after creation.
  */
-async function writeB2BOrderExtraFields(bcOrderId: number, fields: B2BOrderExtraField[]): Promise<void> {
-    await b2bClient.put(`/api/v3/io/orders/${bcOrderId}`, { extraFields: fields });
+async function writeB2BOrderExtraFields(bcOrderId: number, fields: B2BOrderExtraField[], attempt = 1): Promise<void> {
+    try {
+        await b2bClient.put(`/api/v3/io/orders/${bcOrderId}`, { extraFields: fields });
+    } catch (err) {
+        const status = (err as AxiosError).response?.status;
+        if (status === 404 && attempt < B2B_ORDER_MAX_RETRIES) {
+            await new Promise<void>(resolve => { setTimeout(resolve, B2B_ORDER_RETRY_DELAY_MS); });
+            return writeB2BOrderExtraFields(bcOrderId, fields, attempt + 1);
+        }
+        throw err;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +225,10 @@ router.post('/checkout/submit', async (req: Request, res: Response) => {
                 data: {
                     id: string;
                     customer: { email: string };
-                    cart: { line_items: { physical_items: Array<{ id: string; quantity: number }> } };
+                    cart: {
+                        customer_id: number;
+                        line_items: { physical_items: Array<{ id: string; quantity: number }> };
+                    };
                 };
             }>(`/v3/checkouts/${cartId}`),
             fetchB2BAddress(shipToAddressId as number),
@@ -227,7 +243,16 @@ router.post('/checkout/submit', async (req: Request, res: Response) => {
         }
 
         const checkout = checkoutRes.data.data;
-        const customerEmail = checkout.customer?.email ?? '';
+
+        // checkout.customer.email is only populated after billing address is set.
+        // Fall back to fetching the BC customer record via cart.customer_id.
+        let customerEmail = checkout.customer?.email ?? '';
+        if (!customerEmail && checkout.cart?.customer_id) {
+            const custRes = await bcClient.get<{ data: Array<{ email: string }> }>(
+                `/v3/customers?id:in=${checkout.cart.customer_id}`
+            );
+            customerEmail = custRes.data?.data?.[0]?.email ?? '';
+        }
         const lineItems = (checkout.cart?.line_items?.physical_items ?? []).map((item: { id: string; quantity: number }) => ({
             item_id: item.id,
             quantity: item.quantity,
@@ -267,7 +292,7 @@ router.post('/checkout/submit', async (req: Request, res: Response) => {
                 shipping_address: shipCheckoutAddr,
                 line_items: lineItems,
             },
-        ]);
+        ], { params: { include: 'consignments.available_shipping_options' } });
 
         const consignment = consignmentRes.data.data.consignments?.[0];
         if (!consignment) {
@@ -321,24 +346,30 @@ router.post('/checkout/submit', async (req: Request, res: Response) => {
             extraFields.push({ fieldName: 'poNumber', fieldValue: poNumber.trim() });
         }
 
-        // 8. Write all fields to B2B in a single PUT — visible in B2B admin portal and Buyer Portal
-        await writeB2BOrderExtraFields(orderId, extraFields);
+        // 8. Write all fields to B2B asynchronously — B2B syncs new BC orders via webhook
+        //    and the order may not appear in B2B for up to ~45 s after creation.
+        //    The BC order already exists; don't block the client response on B2B sync lag.
+        writeB2BOrderExtraFields(orderId, extraFields).catch(err => {
+            logger.error(`B2B extra fields failed permanently for order ${orderId}: ${(err as Error).message}`);
+        });
 
         logger.info(`checkout submit: orderId=${orderId} status=${orderStatus} carrier=${carrierType}`);
         return res.status(201).json({ orderId, orderStatus });
     } catch (err) {
         const axErr = err as AxiosError;
         const bcStatus = axErr.response?.status;
+        const failedUrl = axErr.config?.url ?? 'unknown';
         if (bcStatus === 404) {
+            logger.error(`checkout submit 404 (cartId=${cartId}) at ${failedUrl}: ${JSON.stringify(axErr.response?.data)}`);
             return res.status(404).json({ error: 'Cart or checkout not found — it may have expired' });
         }
         if (bcStatus === 422) {
-            logger.error(`checkout submit 422 (cartId=${cartId}): ${JSON.stringify(axErr.response?.data)}`);
+            logger.error(`checkout submit 422 (cartId=${cartId}) at ${failedUrl}: ${JSON.stringify(axErr.response?.data)}`);
             return res
                 .status(422)
                 .json({ error: 'Checkout could not be completed — invalid or incomplete checkout state' });
         }
-        logger.error(`checkout submit error (cartId=${cartId}): ${(err as Error).message}`);
+        logger.error(`checkout submit error (cartId=${cartId}) at ${failedUrl}: ${(err as Error).message}`);
         return res.status(500).json({ error: 'Failed to submit checkout' });
     }
 });
