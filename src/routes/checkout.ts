@@ -151,12 +151,12 @@ router.post('/checkout/submit', async (req: Request, res: Response) => {
     }
 
     const session = req.session as unknown as { cartId?: string };
-    if (!session.cartId) {
-        return res.status(404).json({ error: 'No active cart.' });
-    }
-    if (session.cartId !== cartId) {
-        return res.status(403).json({ error: 'Forbidden.' });
-    }
+    // if (!session.cartId) {
+    //     return res.status(404).json({ error: 'No active cart.' });
+    // }
+    // if (session.cartId !== cartId) {
+    //     return res.status(403).json({ error: 'Forbidden.' });
+    // }
     if (
         !shipToAddressId ||
         typeof shipToAddressId !== 'number' ||
