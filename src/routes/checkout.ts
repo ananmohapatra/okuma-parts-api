@@ -150,13 +150,6 @@ router.post('/checkout/submit', async (req: Request, res: Response) => {
         return res.status(400).json({ error: 'cartId must be a valid UUID' });
     }
 
-    const session = req.session as unknown as { cartId?: string };
-    // if (!session.cartId) {
-    //     return res.status(404).json({ error: 'No active cart.' });
-    // }
-    // if (session.cartId !== cartId) {
-    //     return res.status(403).json({ error: 'Forbidden.' });
-    // }
     if (
         !shipToAddressId ||
         typeof shipToAddressId !== 'number' ||
@@ -219,7 +212,7 @@ router.post('/checkout/submit', async (req: Request, res: Response) => {
                 data: {
                     id: string;
                     customer: { email: string };
-                    line_items: { physical_items: Array<{ id: string; quantity: number }> };
+                    cart: { line_items: { physical_items: Array<{ id: string; quantity: number }> } };
                 };
             }>(`/v3/checkouts/${cartId}`),
             fetchB2BAddress(shipToAddressId as number),
@@ -235,7 +228,7 @@ router.post('/checkout/submit', async (req: Request, res: Response) => {
 
         const checkout = checkoutRes.data.data;
         const customerEmail = checkout.customer?.email ?? '';
-        const lineItems = (checkout.line_items?.physical_items ?? []).map(item => ({
+        const lineItems = (checkout.cart?.line_items?.physical_items ?? []).map((item: { id: string; quantity: number }) => ({
             item_id: item.id,
             quantity: item.quantity,
         }));
