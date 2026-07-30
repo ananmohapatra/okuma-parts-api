@@ -549,6 +549,7 @@ router.get('/dealers/context', async (req, res) => {
             const meta = companyMetaById[customerIdToCompanyId[c.id]];
             return {
                 id: c.id,
+                companyId: customerIdToCompanyId[c.id] ?? null,
                 companyName: c.company || null,
                 accountNumber: meta?.accountNumber ?? null,
                 cityState: meta?.cityState ?? null,
