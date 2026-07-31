@@ -48,6 +48,7 @@ interface BcRedirectUrls {
 
 /** Expected request body shape for POST /cart/items. */
 interface AddItemBody {
+    cartId?: unknown;
     productId?: unknown;
     quantity?: unknown;
     variantId?: unknown;
@@ -55,39 +56,6 @@ interface AddItemBody {
     sku?: unknown;
     dealerLocationId?: unknown;
     inventoryTracking?: unknown;
-}
-
-// ---------------------------------------------------------------------------
-// Session helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Read the active cart ID from the Express session.
- * @param req - Express request carrying the session.
- * @returns The stored cart UUID, or null when no cart is active.
- */
-function getCartId(req: Request): string | null {
-    const session = req.session as unknown as Record<string, unknown> & { cartId?: string };
-    return session.cartId ?? null;
-}
-
-/**
- * Write the active cart ID into the Express session.
- * @param req - Express request carrying the session.
- * @param cartId - BC cart UUID to persist.
- */
-function setCartId(req: Request, cartId: string): void {
-    const session = req.session as unknown as Record<string, unknown> & { cartId?: string };
-    session.cartId = cartId;
-}
-
-/**
- * Remove the cart ID from the session, e.g. after the cart is deleted or expires on BC.
- * @param req - Express request carrying the session.
- */
-function clearCartId(req: Request): void {
-    const session = req.session as unknown as Record<string, unknown> & { cartId?: string };
-    delete session.cartId;
 }
 
 // ---------------------------------------------------------------------------
@@ -163,9 +131,9 @@ async function appendCartItem(
 /**
  * POST /cart/items
  *
- * Add a product to the cart. Creates the cart on the first call; appends on
- * subsequent calls using the cartId stored in the session. If the stored cart
- * has expired on BC (404), a new one is created transparently.
+ * Add a product to the cart. If cartId is provided in the body, appends to that
+ * existing cart (creates a new one if it has expired on BC). If cartId is omitted,
+ * always creates a new cart.
  *
  * Body: { productId: number, quantity?: number, variantId?: number, customerId?: number }
  *
@@ -182,6 +150,7 @@ async function appendCartItem(
  */
 router.post('/cart/items', async (req: Request, res: Response) => {
     const {
+        cartId: bodyCartId,
         productId,
         quantity = 1,
         variantId,
@@ -191,6 +160,9 @@ router.post('/cart/items', async (req: Request, res: Response) => {
         inventoryTracking,
     } = req.body as AddItemBody;
 
+    if (bodyCartId !== undefined && (typeof bodyCartId !== 'string' || !/^[0-9a-f-]{36}$/.test(bodyCartId as string))) {
+        return res.status(400).json({ error: 'cartId must be a valid UUID when provided.' });
+    }
     if (!productId || typeof productId !== 'number' || !Number.isInteger(productId) || productId <= 0) {
         return res.status(400).json({ error: 'productId must be a positive integer.' });
     }
@@ -216,11 +188,6 @@ router.post('/cart/items', async (req: Request, res: Response) => {
         return res.status(400).json({ error: 'dealerLocationId must be a positive integer when provided.' });
     }
 
-    const session = req.session as unknown as { customerId?: string };
-    if (customerId !== undefined && session.customerId && session.customerId !== String(customerId)) {
-        return res.status(403).json({ error: 'Forbidden.' });
-    }
-
     // Kick off stock fetch, custom fields, and dealer location resolution in parallel with cart operation.
     const stockFetchPromise: Promise<Record<string, BcInventoryItem>> =
         typeof sku === 'string' ? fetchLocationInventory([sku]) : Promise.resolve({});
@@ -238,16 +205,13 @@ router.post('/cart/items', async (req: Request, res: Response) => {
 
     try {
         let cart: BcCart;
-        const existingCartId = getCartId(req);
 
-        if (existingCartId) {
+        if (bodyCartId) {
             try {
-                cart = await appendCartItem(existingCartId, productId, quantity, variantId as number | undefined);
+                cart = await appendCartItem(bodyCartId as string, productId, quantity, variantId as number | undefined);
             } catch (err) {
-                // Cart expired or deleted on BC — create a fresh one
                 if ((err as AxiosError).response?.status === 404) {
-                    logger.warn(`cart ${existingCartId}: not found on BC, creating new cart`);
-                    clearCartId(req);
+                    logger.warn(`cart ${bodyCartId}: not found on BC, creating new cart`);
                     cart = await createCart(
                         productId,
                         quantity,
@@ -266,8 +230,6 @@ router.post('/cart/items', async (req: Request, res: Response) => {
                 customerId as number | undefined
             );
         }
-
-        setCartId(req, cart.id);
 
         const [redirectUrls, invMap, dealerLocId, customFields] = await Promise.all([
             fetchRedirectUrls(cart.id),
@@ -427,20 +389,23 @@ async function fetchAndShapeCart(cartId: string, res: Response, onNotFound: () =
 }
 
 /**
- * GET /cart
+ * GET /cart?cartId=<uuid>
  *
- * Returns all available carts for the current session as an array.
- * An empty array is returned when no active cart exists (never 404).
- * At most one cart is returned — BC has no multi-cart session support via the
- * management API, but the array envelope keeps the response shape extensible.
+ * Fetch a cart by the cartId query parameter.
+ * Returns an array envelope for forwards-compatibility.
+ * An empty array is returned when cartId is absent (never 404).
  *
  * Response: { carts: ShapedCart[] }
  */
 router.get('/cart', async (req: Request, res: Response) => {
-    const cartId = getCartId(req);
+    const { cartId } = req.query as { cartId?: string };
 
     if (!cartId) {
         return res.json({ carts: [] });
+    }
+
+    if (!/^[0-9a-f-]{36}$/.test(cartId)) {
+        return res.status(400).json({ error: 'cartId must be a valid UUID.' });
     }
 
     try {
@@ -448,7 +413,6 @@ router.get('/cart', async (req: Request, res: Response) => {
         return res.json({ carts: [shaped] });
     } catch (err) {
         if ((err as AxiosError).response?.status === 404) {
-            clearCartId(req);
             return res.json({ carts: [] });
         }
         logger.error(`cart fetch failed (cartId=${cartId}): ${(err as Error).message}`);
@@ -459,8 +423,8 @@ router.get('/cart', async (req: Request, res: Response) => {
 /**
  * GET /cart/:cartId
  *
- * Fetch a cart by explicit ID. Does not require a session — useful for
- * server-to-server calls or when the Stencil theme passes the cartId directly.
+ * Fetch a cart by explicit ID — useful for server-to-server calls or when
+ * the Stencil theme passes the cartId directly.
  * Returns 404 when the cart does not exist or has expired on BC.
  */
 router.get('/cart/:cartId', async (req: Request<{ cartId: string }>, res: Response) => {
@@ -474,69 +438,69 @@ router.get('/cart/:cartId', async (req: Request<{ cartId: string }>, res: Respon
 });
 
 /**
- * DELETE /cart/items/:itemId
+ * DELETE /cart/:cartId/items/:itemId
  *
  * Remove a single line item from the cart.
- * Clears the session cartId when the last item is removed (BC deletes the cart).
+ * Returns 204 on success or when the last item causes BC to auto-delete the cart.
  *
  * Response: 204 No Content on success.
  */
-router.delete('/cart/items/:itemId', async (req: Request, res: Response) => {
-    const cartId = getCartId(req);
-    const { itemId } = req.params;
+router.delete(
+    '/cart/:cartId/items/:itemId',
+    async (req: Request<{ cartId: string; itemId: string }>, res: Response) => {
+        const { cartId, itemId } = req.params;
 
-    if (!cartId) {
-        return res.status(404).json({ error: 'No active cart.' });
-    }
-
-    try {
-        await bcClient.delete(`/v3/carts/${cartId}/items/${itemId}`);
-        return res.status(204).send();
-    } catch (err) {
-        const status = (err as AxiosError).response?.status;
-        if (status === 404) {
-            // BC returns 404 when the last item is removed (cart is auto-deleted)
-            clearCartId(req);
-            return res.status(204).send();
+        if (!cartId || !/^[0-9a-f-]{36}$/.test(cartId)) {
+            return res.status(400).json({ error: 'Invalid cartId.' });
         }
-        logger.error(`cart remove item failed (cartId=${cartId}, itemId=${itemId}): ${(err as Error).message}`);
-        return res.status(500).json({ error: 'Could not remove item from cart.' });
+
+        try {
+            await bcClient.delete(`/v3/carts/${cartId}/items/${itemId}`);
+            return res.status(204).send();
+        } catch (err) {
+            const status = (err as AxiosError).response?.status;
+            if (status === 404) {
+                return res.status(204).send();
+            }
+            logger.error(`cart remove item failed (cartId=${cartId}, itemId=${itemId}): ${(err as Error).message}`);
+            return res.status(500).json({ error: 'Could not remove item from cart.' });
+        }
     }
-});
+);
 
 /**
- * DELETE /cart
+ * DELETE /cart?cartId=<uuid>
  *
- * Delete the cart bound to the current session and clear the session.
+ * Delete a cart by cartId query parameter.
  *
- * Response: 204 No Content on success.
+ * Response: 204 No Content on success or when the cart is already gone.
  */
 router.delete('/cart', async (req: Request, res: Response) => {
-    const cartId = getCartId(req);
+    const { cartId } = req.query as { cartId?: string };
 
     if (!cartId) {
-        return res.status(204).send();
+        return res.status(400).json({ error: 'cartId query parameter is required.' });
+    }
+    if (!/^[0-9a-f-]{36}$/.test(cartId)) {
+        return res.status(400).json({ error: 'cartId must be a valid UUID.' });
     }
 
     try {
         await bcClient.delete(`/v3/carts/${cartId}`);
     } catch (err) {
-        // 404 means BC already removed it — that's fine
         if ((err as AxiosError).response?.status !== 404) {
             logger.error(`cart delete failed (cartId=${cartId}): ${(err as Error).message}`);
             return res.status(500).json({ error: 'Could not delete cart.' });
         }
     }
 
-    clearCartId(req);
     return res.status(204).send();
 });
 
 /**
  * DELETE /cart/:cartId
  *
- * Delete a cart by explicit ID. Does not require a session.
- * If the cartId matches the session cart, the session is also cleared.
+ * Delete a cart by explicit ID.
  *
  * Response: 204 No Content on success or when the cart is already gone.
  */
@@ -554,10 +518,6 @@ router.delete('/cart/:cartId', async (req: Request<{ cartId: string }>, res: Res
             logger.error(`cart delete by id failed (cartId=${cartId}): ${(err as Error).message}`);
             return res.status(500).json({ error: 'Could not delete cart.' });
         }
-    }
-
-    if (getCartId(req) === cartId) {
-        clearCartId(req);
     }
 
     return res.status(204).send();
@@ -591,11 +551,6 @@ router.put('/cart/:cartId', async (req: Request<{ cartId: string }>, res: Respon
         customerId < 0
     ) {
         return res.status(400).json({ error: 'customerId must be a non-negative integer (0 = guest cart).' });
-    }
-
-    const session = req.session as unknown as { customerId?: string };
-    if (customerId > 0 && session.customerId && session.customerId !== String(customerId)) {
-        return res.status(403).json({ error: 'Forbidden.' });
     }
 
     try {
