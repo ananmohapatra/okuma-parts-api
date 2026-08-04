@@ -11,6 +11,7 @@ import {
     fetchB2BCompaniesByGroupName,
     fetchB2BCompanyUsers,
 } from '../services/b2b-hierarchy';
+import { B2BInvoice, fetchAllB2BInvoices } from '../services/b2b-invoice';
 import logger from '../config/logger';
 
 const router = Router();
@@ -538,6 +539,31 @@ async function fetchB2BCompanyUsersCached(companyId: number): Promise<B2BCompany
     return users;
 }
 
+/** Cached full invoice list with a timestamp for TTL checks. */
+interface CachedInvoices {
+    invoices: B2BInvoice[];
+    cachedAt: number;
+}
+
+/** In-memory cache of the B2B Invoice Portal's full invoice list (no server-side order filter exists to key this by order instead). */
+let invoicesCache: CachedInvoices | null = null;
+
+/**
+ * Cached wrapper (5 min TTL, same as the hierarchy/company-users caches) around
+ * fetchAllB2BInvoices — GET /orders/:orderId calls this on every request, and the
+ * B2B API has no server-side filter by order, so without this every detail-page
+ * load would re-walk the store's entire invoice list.
+ * @returns Every invoice in the store (cached for up to 5 minutes).
+ */
+async function fetchAllB2BInvoicesCached(): Promise<B2BInvoice[]> {
+    if (invoicesCache && Date.now() - invoicesCache.cachedAt < HIERARCHY_CACHE_TTL_MS) {
+        return invoicesCache.invoices;
+    }
+    const invoices = await fetchAllB2BInvoices();
+    invoicesCache = { invoices, cachedAt: Date.now() };
+    return invoices;
+}
+
 /**
  * Resolves every BC customer ID belonging to a dealer's own customer group,
  * caching the result on the dealer's B2B user extra field (`dealer_customer_ids`)
@@ -1055,6 +1081,13 @@ router.get('/orders', async (req: Request, res: Response) => {
  * anywhere (order, shipment, or otherwise) for an estimated delivery date, so
  * this is a permanent placeholder, not a not-yet-populated one.
  *
+ * `invoiceId`/`invoiceNumber` are null until an invoice is explicitly created
+ * for this order via the B2B Invoice Portal (POST /api/v3/io/ip/orders/{id}/invoices)
+ * — invoice creation is a separate, not-yet-automated action (pending a future
+ * order-placement story), so most orders will have no invoice. B2B has no
+ * server-side filter for looking up an order's invoice, so every invoice in the
+ * store is fetched (cached 5 min) and matched here by orderNumber.
+ *
  * Query: ?customerId=248
  *
  * Response:
@@ -1062,6 +1095,7 @@ router.get('/orders', async (req: Request, res: Response) => {
  *   orderId, orderNumber, orderDate, statusId, status,
  *   orderedFor, poReference, placedByName, machineSerial, paymentMethod,
  *   carrierType, carrierAccountNumber, machineDownContactName, machineDownContactPhone,
+ *   invoiceId, invoiceNumber,
  *   lineItems: [{ productId, sku, name, quantity, unitPrice, lineTotal }],
  *   costBreakdown: { subtotal, shipping, tax, total, currency },
  *   shipping: {
@@ -1135,7 +1169,7 @@ router.get('/orders/:orderId', async (req: Request, res: Response) => {
 
         // -- 4. Authorized — fetch the remaining sub-resources in parallel, plus
         // this order's own B2B extra fields --
-        const [products, shippingAddresses, shipments, extraFields] = await Promise.all([
+        const [products, shippingAddresses, shipments, extraFields, invoices] = await Promise.all([
             bcClient
                 .get<BcOrderProduct[]>(`/v2/orders/${orderId}/products`)
                 .then(r => (Array.isArray(r.data) ? r.data : []))
@@ -1149,10 +1183,17 @@ router.get('/orders/:orderId', async (req: Request, res: Response) => {
                 .then(r => (Array.isArray(r.data) ? r.data : []))
                 .catch(() => [] as BcOrderShipment[]),
             fetchB2BOrderExtraFields(orderId),
+            fetchAllB2BInvoicesCached().catch(() => [] as B2BInvoice[]),
         ]);
 
         const shippingAddress = shippingAddresses[0];
         const shipment = shipments[0];
+        // No B2B endpoint filters invoices by order server-side (confirmed live —
+        // ?orderNumber= is ignored and returns every invoice), so the match happens
+        // here against the already-fetched full list. Most orders have no invoice
+        // yet — invoice creation is a separate explicit action, not automatic on
+        // order placement — so no match is the expected, common case, not an error.
+        const invoice = invoices.find(inv => Number(inv.orderNumber) === order.id) ?? null;
 
         // Second-tier authorization check, on top of the hierarchy-membership check
         // above: hierarchy membership alone would let a dealer open any order under
@@ -1196,6 +1237,8 @@ router.get('/orders/:orderId', async (req: Request, res: Response) => {
             carrierAccountNumber: extraFields[ORDER_EXTRA_FIELD_CARRIER_ACCOUNT_NUMBER] || '',
             machineDownContactName: extraFields[ORDER_EXTRA_FIELD_MACHINE_DOWN_CONTACT_NAME] || '',
             machineDownContactPhone: extraFields[ORDER_EXTRA_FIELD_MACHINE_DOWN_CONTACT_PHONE] || '',
+            invoiceId: invoice?.id ?? null,
+            invoiceNumber: invoice?.invoiceNumber ?? null,
             // Number(...) throughout -- BC v2 order/product monetary fields are
             // commonly serialized as strings (confirmed in this file's test fixtures
             // and live Postman testing), which would otherwise leak into fields
