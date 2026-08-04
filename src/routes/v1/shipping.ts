@@ -13,7 +13,7 @@ interface ShippingMethod {
 // Freight is a carrier-agnostic shipping method included for every carrier that supports method selection.
 const FREIGHT_METHOD: ShippingMethod = {
     id: 'freight',
-    name: 'Freight (carrier-agnostic)',
+    name: 'Freight',
     estimatedDelivery: 'Varies by carrier',
 };
 
