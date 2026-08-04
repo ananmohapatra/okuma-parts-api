@@ -6,7 +6,7 @@ import logger from '../config/logger';
 
 const router = Router();
 
-const VALID_CARRIER_TYPES = ['Prepaid', 'FedEx', 'UPS', 'MachineDown', 'OtherCarrier'] as const;
+const VALID_CARRIER_TYPES = ['Prepaid', 'FedEx', 'UPS', 'MachineDown', 'OtherCarrier', 'Freight'] as const;
 type CarrierType = (typeof VALID_CARRIER_TYPES)[number];
 
 // ---------------------------------------------------------------------------
@@ -147,11 +147,11 @@ async function writeB2BOrderExtraFields(bcOrderId: number, fields: B2BOrderExtra
  *   cartId                  - BC cart UUID (required)
  *   shipToAddressId         - B2B address ID for shipping destination (required)
  *   billToAddressId         - B2B address ID for billing (required)
- *   carrierType             - Prepaid | FedEx | UPS | MachineDown | OtherCarrier (required)
+ *   carrierType             - Prepaid | FedEx | UPS | MachineDown | OtherCarrier | Freight (required)
  *   carrierAccountNumber    - account number for FedEx, UPS, MachineDown (required for those carriers)
  *   machineDownContactName  - contact name (required when carrierType=MachineDown)
  *   machineDownContactPhone - contact phone (required when carrierType=MachineDown)
- *   shippingMethod          - method id selected by the user, e.g. "next_day_air" (required)
+ *   shippingMethod          - method id selected by the user, e.g. "next_day" (required)
  *   poNumber                - purchase order number (required when paymentMethod is "purchase_order")
  *   paymentMethod           - "credit_card" | "purchase_order" (required)
  *
