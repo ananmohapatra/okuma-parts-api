@@ -1482,6 +1482,8 @@ describe('Dashboard orders API', () => {
                 carrierAccountNumber: '',
                 machineDownContactName: '',
                 machineDownContactPhone: '',
+                invoiceId: null,
+                invoiceNumber: null,
                 lineItems: [
                     {
                         productId: 1,
@@ -1706,6 +1708,70 @@ describe('Dashboard orders API', () => {
             expect(res.body.shipping.trackingNumber).toBeNull();
             expect(res.body.shipping.trackingCarrier).toBeNull();
             expect(res.body.shipping.shippedOn).toBeNull();
+        });
+    });
+
+    // -----------------------------------------------------------------------
+    // GET /v1/dashboard/orders/:orderId — invoice population
+    // -----------------------------------------------------------------------
+
+    describe('GET /v1/dashboard/orders/:orderId — invoice population', () => {
+        it('returns invoiceId/invoiceNumber for an order with a matching B2B invoice, and null for one without', async () => {
+            const dealerId = 820;
+            const dealerCompanyId = 1820;
+            const dealerCompanyName = 'Dealer Co 820';
+            const orderIdWithInvoice = 9840;
+            const orderIdWithoutInvoice = 9841;
+
+            // setupHierarchy's own dispatcher has no branch for the B2B Invoice
+            // Portal endpoint (out of scope for every other test) -- wrap it here
+            // rather than editing the shared helper, so this stays the only test
+            // that cares about invoice matching.
+            setupHierarchy({ dealerCompanyId, dealerCompanyName, subsidiaries: [] });
+            const hierarchyB2bGet = mockB2bGet.getMockImplementation()!;
+            mockB2bGet.mockImplementation((url: string, config?: { params?: Record<string, unknown> }) => {
+                if (url === '/api/v3/io/ip/invoices') {
+                    return Promise.resolve({
+                        data: { data: [{ id: 555111, invoiceNumber: '555111', orderNumber: orderIdWithInvoice }] },
+                    });
+                }
+                return hierarchyB2bGet(url, config);
+            });
+
+            setupOrderDetailBc({
+                orderId: orderIdWithInvoice,
+                order: orderDetailFixture(orderIdWithInvoice, dealerId),
+                dealerId,
+                dealerEmail: 'dealer820@test.com',
+                products: [],
+                shippingAddresses: [],
+                shipments: [],
+            });
+            const resWithInvoice = await request(app)
+                .get(`${ORDER_DETAIL_URL(orderIdWithInvoice)}?customerId=${dealerId}`)
+                .set(AUTH);
+            expect(resWithInvoice.status).toBe(200);
+            expect(resWithInvoice.body.invoiceId).toBe(555111);
+            expect(resWithInvoice.body.invoiceNumber).toBe('555111');
+
+            // Same cached invoice list (fetched once above, within its 5-minute TTL)
+            // correctly yields no match for a different order — proves the match is
+            // per-order, not "an invoice exists somewhere so every order gets one".
+            setupOrderDetailBc({
+                orderId: orderIdWithoutInvoice,
+                order: orderDetailFixture(orderIdWithoutInvoice, dealerId),
+                dealerId,
+                dealerEmail: 'dealer820@test.com',
+                products: [],
+                shippingAddresses: [],
+                shipments: [],
+            });
+            const resWithoutInvoice = await request(app)
+                .get(`${ORDER_DETAIL_URL(orderIdWithoutInvoice)}?customerId=${dealerId}`)
+                .set(AUTH);
+            expect(resWithoutInvoice.status).toBe(200);
+            expect(resWithoutInvoice.body.invoiceId).toBeNull();
+            expect(resWithoutInvoice.body.invoiceNumber).toBeNull();
         });
     });
 
