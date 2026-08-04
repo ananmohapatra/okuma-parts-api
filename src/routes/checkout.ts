@@ -6,7 +6,7 @@ import logger from '../config/logger';
 
 const router = Router();
 
-const VALID_CARRIER_TYPES = ['Prepaid', 'FedEx', 'UPS', 'MachineDown', 'OtherCarrier', 'Freight'] as const;
+const VALID_CARRIER_TYPES = ['Prepaid', 'FedEx', 'UPS', 'MachineDown', 'OtherCarrier'] as const;
 type CarrierType = (typeof VALID_CARRIER_TYPES)[number];
 
 // ---------------------------------------------------------------------------

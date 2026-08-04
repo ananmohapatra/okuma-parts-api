@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 
 const router = Router();
 
-type CarrierType = 'Prepaid' | 'FedEx' | 'UPS' | 'MachineDown' | 'OtherCarrier' | 'Freight';
+type CarrierType = 'Prepaid' | 'FedEx' | 'UPS' | 'MachineDown' | 'OtherCarrier';
 
 interface ShippingMethod {
     id: string;
@@ -10,12 +10,20 @@ interface ShippingMethod {
     estimatedDelivery: string;
 }
 
-// Shared by Prepaid, FedEx, UPS, and Freight (carrier-agnostic). No pricing in Phase 1 — timelines only.
+// Freight is a carrier-agnostic shipping method included for every carrier that supports method selection.
+const FREIGHT_METHOD: ShippingMethod = {
+    id: 'freight',
+    name: 'Freight (carrier-agnostic)',
+    estimatedDelivery: 'Varies by carrier',
+};
+
+// Base methods shared by Prepaid, FedEx, UPS, and MachineDown. No pricing in Phase 1 — timelines only.
 const STANDARD_METHODS: ShippingMethod[] = [
     { id: 'next_day', name: 'Next Day', estimatedDelivery: '1 business day' },
     { id: 'two_day', name: '2-Day', estimatedDelivery: '2 business days' },
     { id: 'three_day', name: '3-Day', estimatedDelivery: '3 business days' },
     { id: 'ground', name: 'Ground', estimatedDelivery: '5–7 business days' },
+    FREIGHT_METHOD,
 ];
 
 const SHIPPING_METHODS: Record<CarrierType, ShippingMethod[]> = {
@@ -36,17 +44,10 @@ const SHIPPING_METHODS: Record<CarrierType, ShippingMethod[]> = {
 
     // Distributor arranges shipment; no method selection needed.
     OtherCarrier: [],
-
-    // Carrier-agnostic freight option; not tied to a specific carrier account.
-    // No shipping cost calculation in Phase 1 — estimated delivery timelines only.
-    Freight: STANDARD_METHODS,
 };
 
 // Carriers that require no method selection (frontend should hide the method picker).
 const CARRIERS_WITHOUT_METHODS: CarrierType[] = ['OtherCarrier'];
-
-// Freight is carrier-agnostic: not associated with any single carrier account.
-const CARRIER_AGNOSTIC: CarrierType[] = ['Freight'];
 
 const VALID_CARRIERS = Object.keys(SHIPPING_METHODS) as CarrierType[];
 
@@ -55,13 +56,13 @@ const VALID_CARRIERS = Object.keys(SHIPPING_METHODS) as CarrierType[];
  *
  * Returns available shipping methods and estimated delivery text for the given carrier type.
  * OtherCarrier returns an empty methods array (carrier-managed, no method selection).
- * Freight is carrier-agnostic: methods are returned but carrierAgnostic flag is true.
+ * Freight is a method included in every carrier list that supports method selection — not a carrier itself.
  * No shipping cost calculation in Phase 1 — all methods expose estimatedDelivery only.
  *
  * Query params:
- *   carrier - Prepaid | FedEx | UPS | MachineDown | OtherCarrier | Freight (required)
+ *   carrier - Prepaid | FedEx | UPS | MachineDown | OtherCarrier (required)
  *
- * Response: { carrier, carrierAgnostic, methods: [{ id, name, estimatedDelivery }] }
+ * Response: { carrier, requiresMethodSelection, methods: [{ id, name, estimatedDelivery }] }
  */
 router.get('/shipping/methods', (req: Request, res: Response) => {
     const { carrier } = req.query;
@@ -80,7 +81,6 @@ router.get('/shipping/methods', (req: Request, res: Response) => {
 
     return res.json({
         carrier: carrierType,
-        carrierAgnostic: CARRIER_AGNOSTIC.includes(carrierType),
         requiresMethodSelection: !CARRIERS_WITHOUT_METHODS.includes(carrierType),
         methods: SHIPPING_METHODS[carrierType],
     });
